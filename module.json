@@ -5,7 +5,7 @@
   "id": "gallery",
   "name": "Gallery",
   "summary": "Browse, search and manage local AI image collections.",
-  "version": "1.2.13",
+  "version": "1.2.14",
   "minimum_hub_version": "1.3.0",
   "repository": "cyberdeliaAI/CyberHub-Gallery",
   "publisher_type": "official",

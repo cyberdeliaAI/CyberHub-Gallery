@@ -2460,7 +2460,7 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 .app.meta-collapsed { grid-template-columns:260px 1fr 0; }
 .topbar { grid-column:1/-1; background:var(--bg-dark); border-bottom:1px solid var(--border); display:flex; align-items:center; padding:0 16px; gap:16px; z-index:10; }
 .sidebar { grid-row:2; background:var(--bg-panel); border-right:1px solid var(--border); overflow-y:auto; overflow-x:hidden; }
-.gallery-area { grid-row:2; overflow-y:auto; background:var(--bg-dark); padding:0px 12px 12px 12px; position:relative; display:flex; flex-direction:column; }
+.gallery-area { grid-row:2; min-width:0; overflow-y:auto; scrollbar-gutter:stable; background:var(--bg-dark); padding:0px 12px 12px 12px; position:relative; display:flex; flex-direction:column; }
 .meta-panel { grid-row:2; background:var(--bg-panel); border-left:1px solid var(--border); overflow-y:auto; display:flex; flex-direction:column; min-width:0; transition:opacity .15s ease; }
 .app.meta-collapsed .meta-panel { opacity:0; pointer-events:none; border-left:0; overflow:hidden; }
 .statusbar { grid-column:1/-1; background:var(--bg-dark); border-top:1px solid var(--border); display:flex; align-items:center; padding:0 12px; font-size:11px; color:var(--text-dim); gap:16px; }
@@ -2540,7 +2540,12 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 .folder-children.open { display:block; }
 
 /* Gallery Grid */
-.gallery-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(var(--thumb-size),1fr)); gap:8px; flex:1; align-content:start; }
+.gallery-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(100%,var(--thumb-size)),1fr)); gap:8px; flex:1; align-content:start; }
+.gallery-grid.masonry { display:block; position:relative; flex:none; }
+.gallery-grid.masonry > .thumb-card, .gallery-grid.masonry > .gallery-group-header { position:absolute; }
+.gallery-grid.masonry > .thumb-card { aspect-ratio:auto; transition:border-color .15s, box-shadow .15s, transform .15s; }
+.gallery-grid.masonry > .gallery-group-header { margin:0; }
+.gallery-grid.masonry .thumb-card img { object-fit:contain; }
 .gallery-group-header { grid-column:1/-1; display:flex; align-items:center; gap:8px; min-height:28px; margin:8px 0 0; padding:4px 2px; color:var(--text-bright); font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; border-bottom:1px solid var(--border); }
 .gallery-group-dot { width:9px; height:9px; border-radius:50%; background:var(--model-color,#64748b); box-shadow:0 0 12px var(--model-color,#64748b); flex-shrink:0; }
 .gallery-group-count { color:var(--text-dim); font-family:var(--mono); font-size:10px; font-weight:500; margin-left:2px; }
@@ -2627,6 +2632,8 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
     min-height:32px;
 }
 .gallery-toolbar .gt-info { padding-left:8px; }
+.gallery-layout { display:flex; align-items:center; gap:6px; margin-left:auto; padding:0 12px; white-space:nowrap; }
+.gallery-layout select:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 .gallery-toolbar .gt-nav { display:flex; align-items:center; gap:4px; padding-right:4px; }
 .gallery-toolbar .gt-nav button {
     background:var(--bg-card); border:1px solid var(--border); color:var(--text-dim);
@@ -2898,6 +2905,13 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
         <div class="loading-bar" id="loadingBar"></div>
         <div class="gallery-toolbar" id="galleryToolbar" style="display:none">
             <div class="gt-info" id="galleryCount"></div>
+            <div class="gallery-layout">
+                <label for="layoutSelect">Layout</label>
+                <select class="sort-select" id="layoutSelect" title="Grid uses square tiles; Masonry preserves image proportions">
+                    <option value="grid">Grid</option>
+                    <option value="masonry">Masonry</option>
+                </select>
+            </div>
             <div class="gt-nav">
                 <button id="gtPrev" title="Previous page">&#x2039;</button>
                 <span class="gt-page" id="gtPage" title="Click to jump to page"></span>
@@ -3043,6 +3057,10 @@ var accordionFolders = {ACCORDION_FOLDERS};
 var skipDeleteConfirmation = {SKIP_DELETE_CONFIRMATION};
 var folderSortMode = '{FOLDER_SORT}';
 var galleryGroupMode = localStorage.getItem('galleryGroupMode') || 'none';
+var galleryLayout = 'grid';
+try { if (localStorage.getItem('galleryLayout') === 'masonry') galleryLayout = 'masonry'; } catch (e) {}
+var galleryLayoutFrame = null;
+var galleryThumbObserver = null;
 var metadataFilter = localStorage.getItem('galleryMetadataFilter') || 'all';
 if (['all', 'with', 'without'].indexOf(metadataFilter) < 0) metadataFilter = 'all';
 var autoTaggerAvailable = {AUTO_TAGGER_AVAILABLE};
@@ -3609,6 +3627,66 @@ function showGalleryPlaceholder(title, detail) {
     if (empty) empty.style.display = 'flex';
 }
 
+// Reuse the current page and thumbnail cache. Place each card in the shortest
+// column without changing DOM/file order; headings separate full-width groups.
+function layoutGallery() {
+    var grid = document.getElementById('galleryGrid');
+    var masonry = galleryLayout === 'masonry';
+    grid.classList.toggle('masonry', masonry);
+    var items = Array.from(grid.children);
+    if (!masonry) {
+        grid.style.removeProperty('height');
+        items.forEach(function(item) {
+            ['left', 'top', 'width', 'height'].forEach(function(property) { item.style.removeProperty(property); });
+        });
+        return;
+    }
+    if (!items.length) {
+        grid.style.height = '0px';
+        return;
+    }
+    var availableWidth = grid.clientWidth;
+    if (!availableWidth) return;
+    var gap = 8;
+    var thumbSize = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--thumb-size')) || 180;
+    var columns = Math.max(1, Math.floor((availableWidth + gap) / (thumbSize + gap)));
+    var width = (availableWidth - gap * (columns - 1)) / columns;
+    var heights = Array(columns).fill(0);
+    // Batch width writes before measuring wrapped headings to avoid per-card reflows.
+    items.forEach(function(item) {
+        item.style.width = (item.classList.contains('gallery-group-header') ? availableWidth : width) + 'px';
+    });
+    var headerHeights = items.map(function(item) {
+        return item.classList.contains('gallery-group-header') ? item.offsetHeight : 0;
+    });
+    items.forEach(function(item, index) {
+        if (item.classList.contains('gallery-group-header')) {
+            var top = Math.max.apply(null, heights);
+            item.style.left = '0px';
+            item.style.top = top + 'px';
+            heights.fill(top + headerHeights[index] + gap);
+            return;
+        }
+        var column = heights.indexOf(Math.min.apply(null, heights));
+        var ratio = Number(item.dataset.aspectRatio) || 1;
+        // Account for the 2px border on each side when sizing the image content.
+        var height = Math.max(0, width - 4) / ratio + 4;
+        item.style.left = (column * (width + gap)) + 'px';
+        item.style.top = heights[column] + 'px';
+        item.style.height = height + 'px';
+        heights[column] += height + gap;
+    });
+    grid.style.height = Math.max(0, Math.max.apply(null, heights) - gap) + 'px';
+}
+
+function scheduleGalleryLayout() {
+    if (galleryLayout !== 'masonry' || galleryLayoutFrame !== null) return;
+    galleryLayoutFrame = requestAnimationFrame(function() {
+        galleryLayoutFrame = null;
+        layoutGallery();
+    });
+}
+
 function safeModelColor(color) {
     return /^#[0-9a-fA-F]{6}$/.test(color || '') ? color : '#64748b';
 }
@@ -3644,6 +3722,8 @@ function createThumbCard(file, index) {
     card.className = 'thumb-card';
     card.dataset.path = file.path;
     card.dataset.index = index;
+    var hasDimensions = Number(file.width) > 0 && Number(file.height) > 0;
+    card.dataset.aspectRatio = hasDimensions ? file.width / file.height : 1;
     var dimsText = (file.width && file.height) ? file.width + '\u00D7' + file.height : '';
     var favClass = file.favorite ? 'thumb-fav active' : 'thumb-fav';
     var favStar = file.favorite ? '\u2605' : '\u2606';
@@ -3658,6 +3738,16 @@ function createThumbCard(file, index) {
         (dimsText ? '<div class="thumb-dims">' + dimsText + '</div>' : '') +
         (showModelBadge ? '<div class="thumb-model-badge">' + escHtml(groupInfo.label) + '</div>' : '') +
         '<div class="thumb-overlay"><div class="thumb-name">' + escHtml(file.name) + '</div></div>';
+    // Newly indexed files start square until their lazy-loaded thumbnail supplies
+    // its intrinsic dimensions. No original image request or extra cache is needed.
+    if (!hasDimensions) {
+        card.querySelector('img').addEventListener('load', function() {
+            if (this.naturalWidth && this.naturalHeight) {
+                card.dataset.aspectRatio = this.naturalWidth / this.naturalHeight;
+                if (card.isConnected) scheduleGalleryLayout();
+            }
+        });
+    }
     // Star click handler (stop propagation so card click doesn't fire)
     card.querySelector('.thumb-fav').addEventListener('click', (function(fp) {
         return function(e) {
@@ -3674,7 +3764,7 @@ function createThumbCard(file, index) {
         } else if (e.shiftKey && selectedFile) {
             // Range select
             e.preventDefault();
-            rangeSelect(idx);
+            rangeSelect(Array.from(document.querySelectorAll('.thumb-card')).indexOf(c));
         } else {
             // Normal click: clear multi-select if any, then select for metadata
             if (multiSelected.size > 0) { clearMultiSelect(); }
@@ -3682,6 +3772,7 @@ function createThumbCard(file, index) {
         }
     }})(file.path, card, index));
     card.addEventListener('dblclick', (function(idx,fp){return function(){lightboxIndex=idx; openLightbox('/image/'+encodeURIComponent(fp))}})(index, file.path));
+    if (selectedFile === file.path) card.classList.add('selected');
     // Restore multi-select state if re-rendering same page
     if (multiSelected.has(file.path)) { card.classList.add('multi-selected'); }
     return card;
@@ -3693,6 +3784,8 @@ function renderGalleryFiles(files, total, isSearch) {
     var toolbar = document.getElementById('galleryToolbar');
     var countEl = document.getElementById('galleryCount');
     lastGalleryTotal = total || files.length || 0;
+    if (galleryThumbObserver) galleryThumbObserver.disconnect();
+    grid.innerHTML = '';
 
     if (files.length === 0) {
         var metadataFiltered = metadataFilter !== 'all';
@@ -3709,7 +3802,7 @@ function renderGalleryFiles(files, total, isSearch) {
         return;
     }
 
-    grid.style.display = 'grid';
+    grid.style.display = '';
     empty.style.display = 'none';
     toolbar.style.display = 'flex';
     var label = isSearch ? ' results' : ' images';
@@ -3718,7 +3811,6 @@ function renderGalleryFiles(files, total, isSearch) {
     var metaDetail = metaCount ? ' · ' + metaCount + ' with metadata on page' : '';
     countEl.textContent = total + label + pageDetail + metaDetail;
     updateToolbarNav();
-    grid.innerHTML = '';
 
     var observer = new IntersectionObserver(function(entries) {
         entries.forEach(function(entry) {
@@ -3728,7 +3820,8 @@ function renderGalleryFiles(files, total, isSearch) {
                 observer.unobserve(entry.target);
             }
         });
-    }, { rootMargin: '300px' });
+    }, { root: document.getElementById('galleryArea'), rootMargin: '300px' });
+    galleryThumbObserver = observer;
 
     if (galleryGroupMode === 'none') {
         for (var i = 0; i < files.length; i++) {
@@ -3756,6 +3849,7 @@ function renderGalleryFiles(files, total, isSearch) {
             });
         });
     }
+    layoutGallery();
     // Prefetch next page thumbnails
     restoreGalleryScrollIfNeeded();
     scheduleGalleryStateSave();
@@ -4337,7 +4431,27 @@ document.getElementById('metadataFilterSelect').addEventListener('change', funct
     else { loadGallery(currentFolder); }
     scheduleGalleryStateSave();
 });
-document.getElementById('thumbSlider').addEventListener('input', function(e) { document.documentElement.style.setProperty('--thumb-size', e.target.value+'px'); });
+document.getElementById('layoutSelect').value = galleryLayout;
+document.getElementById('layoutSelect').addEventListener('change', function() {
+    galleryLayout = this.value === 'masonry' ? 'masonry' : 'grid';
+    try { localStorage.setItem('galleryLayout', galleryLayout); } catch (e) {}
+    layoutGallery();
+    scheduleGalleryStateSave();
+});
+document.getElementById('thumbSlider').addEventListener('input', function(e) {
+    document.documentElement.style.setProperty('--thumb-size', e.target.value+'px');
+    scheduleGalleryLayout();
+});
+// Available width also changes when the metadata panel opens or closes.
+var galleryObservedWidth = 0;
+var galleryResizeObserver = new ResizeObserver(function(entries) {
+    var width = entries[0].contentRect.width;
+    if (width !== galleryObservedWidth) {
+        galleryObservedWidth = width;
+        scheduleGalleryLayout();
+    }
+});
+galleryResizeObserver.observe(document.getElementById('galleryGrid'));
 document.getElementById('galleryArea').addEventListener('scroll', scheduleGalleryStateSave);
 document.getElementById('metaToggleBtn').addEventListener('click', function() {
     setMetaPanelCollapsed(!metaPanelCollapsed);
@@ -4462,7 +4576,37 @@ function getCardIndexByPath(cards, path) {
     return cards.findIndex(function(c){ return c.dataset.path === path; });
 }
 
+function getMasonryArrowTargetIndex(cards, idx, key) {
+    if (['ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp'].indexOf(key) < 0) return idx;
+    var horizontal = key === 'ArrowLeft' || key === 'ArrowRight';
+    var forward = key === 'ArrowRight' || key === 'ArrowDown';
+    var current = cards[idx];
+    var start = horizontal ? current.offsetLeft : current.offsetTop;
+    var size = horizontal ? current.offsetWidth : current.offsetHeight;
+    var crossStart = horizontal ? current.offsetTop : current.offsetLeft;
+    var crossSize = horizontal ? current.offsetHeight : current.offsetWidth;
+    var best = idx, bestOverlap = false, bestDistance = Infinity;
+    cards.forEach(function(card, index) {
+        if (index === idx) return;
+        var candidateStart = horizontal ? card.offsetLeft : card.offsetTop;
+        var candidateSize = horizontal ? card.offsetWidth : card.offsetHeight;
+        var distance = forward ? candidateStart - (start + size) : start - (candidateStart + candidateSize);
+        if (distance < -1) return;
+        var candidateCross = horizontal ? card.offsetTop : card.offsetLeft;
+        var candidateCrossSize = horizontal ? card.offsetHeight : card.offsetWidth;
+        var overlaps = candidateCross < crossStart + crossSize && candidateCross + candidateCrossSize > crossStart;
+        distance += Math.abs(candidateCross + candidateCrossSize / 2 - crossStart - crossSize / 2);
+        if ((overlaps && !bestOverlap) || (overlaps === bestOverlap && distance < bestDistance)) {
+            best = index;
+            bestOverlap = overlaps;
+            bestDistance = distance;
+        }
+    });
+    return best;
+}
+
 function getArrowTargetIndex(cards, idx, cols, key) {
+    if (galleryLayout === 'masonry') return getMasonryArrowTargetIndex(cards, idx, key);
     if (key === 'ArrowRight') return Math.min(idx + 1, cards.length - 1);
     if (key === 'ArrowLeft') return Math.max(idx - 1, 0);
     if (key === 'ArrowDown') return Math.min(idx + cols, cards.length - 1);
@@ -5279,7 +5423,7 @@ class GalleryModule(Module):
     """Module wrapper around GalleryDB + the HTML gallery UI."""
 
     name = "Gallery"
-    version = "1.2.13"
+    version = "1.2.14"
     icon = "\U0001F5BC"   # 🖼
     description = "Browse and manage your AI-generated image collection."
     order = 10
