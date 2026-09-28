@@ -1,0 +1,10 @@
+{
+  "webp_encodes": 2,
+  "cached_webp_files": 1,
+  "request_generation_ms": 127.419,
+  "subsequent_processing_ms": 24.642,
+  "original_bytes": 3989397,
+  "thumbnail_bytes": 15356,
+  "synthetic_image": true,
+  "explanation": "A thumbnail requested before metadata processing is generated again by the worker. One cache file is overwritten, not two stored thumbnails."
+}

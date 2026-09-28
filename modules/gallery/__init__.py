@@ -34,7 +34,9 @@ import threading
 import time
 import traceback
 from collections import deque
+from contextlib import contextmanager
 from io import BytesIO
+from itertools import islice
 from pathlib import Path
 
 from core import Module
@@ -50,6 +52,42 @@ THUMB_SIZE = (300, 300)
 # installs default that directory to the portable CyberHub folder.
 DEFAULT_PER_PAGE = 200       # overwritten from settings on startup
 DEFAULT_REINDEX_INTERVAL = 30
+# Shared by on-demand maintenance and background processing. A bounded set of
+# locks avoids duplicate encodes without retaining a lock for every library file.
+_THUMB_LOCKS = [threading.RLock() for _ in range(128)]
+
+
+def thumbnail_lock(path):
+    return _THUMB_LOCKS[int(hashlib.md5(path.encode()).hexdigest()[:8], 16) % len(_THUMB_LOCKS)]
+
+
+def thumbnail_is_current(thumb_path, source_mtime):
+    try:
+        return os.path.getsize(thumb_path) > 0 and os.path.getmtime(thumb_path) >= source_mtime
+    except OSError:
+        return False
+
+
+class _SourceChanged(Exception):
+    def __init__(self, path):
+        self.path = path
+
+
+class _ThreadConnections:
+    """Close SQLite connections when their request/worker thread exits."""
+    def __init__(self):
+        self.connections = []
+
+    def close(self):
+        for conn in self.connections:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        self.connections.clear()
+
+    def __del__(self):
+        self.close()
 
 try:
     from PIL import Image
@@ -177,6 +215,14 @@ class GalleryDB:
         self._processing_claimed = set()
         self._processing_priority = deque()
         self._processing_priority_set = set()
+        self._thumbnail_requests = set()
+        self._thumbnail_failures = {}
+        self._pending_thumb_cleanup = set()
+        self._delete_inflight = set()
+        self._delete_lock = threading.Lock()
+        self._revision_lock = threading.Lock()
+        self._revision = 0
+        self._legacy_search_cache = None
         self._processing_active = 0
         self._processing_session_done = 0
         self._processing_failures = {}
@@ -194,10 +240,66 @@ class GalleryDB:
     def _get_conn(self):
         if not hasattr(self._local, "conn"):
             self._local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._track_connection(self._local.conn)
             self._local.conn.execute("PRAGMA journal_mode=WAL")
             self._local.conn.execute("PRAGMA synchronous=NORMAL")
             self._local.conn.execute("PRAGMA busy_timeout=30000")
         return self._local.conn
+
+    def _track_connection(self, conn):
+        if not hasattr(self._local, "connections"):
+            self._local.connections = _ThreadConnections()
+        self._local.connections.connections.append(conn)
+
+    @contextmanager
+    def _read_snapshot(self):
+        """Read the last committed WAL snapshot, independently of Gallery writers.
+
+        Use a separate connection even when called from a writer's thread. A
+        read must never accidentally include or roll back its pending writes.
+        Keep these transactions short so WAL checkpoints can still advance.
+        """
+        if not hasattr(self._local, "reader"):
+            reader = sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
+            self._track_connection(reader)
+            reader.execute("PRAGMA query_only=ON")
+            reader.execute("PRAGMA busy_timeout=30000")
+            self._local.reader = reader
+        conn = self._local.reader
+        nested = conn.in_transaction
+        if not nested:
+            conn.execute("BEGIN")
+        try:
+            yield conn
+        finally:
+            if not nested:
+                conn.rollback()
+
+    def _mark_changed(self):
+        with self._revision_lock:
+            self._revision += 1
+            self._legacy_search_cache = None
+
+    @property
+    def revision(self):
+        with self._revision_lock:
+            return self._revision
+
+    def _cleanup_pruned_thumbnails(self):
+        # Filesystem I/O must not keep the writer lock held. Recheck the record
+        # after taking the per-thumbnail lock in case the path was recreated.
+        with self.lock:
+            paths = self._pending_thumb_cleanup
+            self._pending_thumb_cleanup = set()
+        for path in paths:
+            with thumbnail_lock(path):
+                with self._read_snapshot() as conn:
+                    exists = conn.execute("SELECT 1 FROM files WHERE path=?", (path,)).fetchone()
+                if not exists:
+                    try:
+                        os.remove(get_thumb_path(self.thumb_dir, path))
+                    except OSError:
+                        pass
 
     def optimize(self, progress=None):
         """Compact + refresh the database. Returns a dict describing what ran.
@@ -345,6 +447,7 @@ class GalleryDB:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_files_folder_name ON files(folder, name)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_files_folder_mtime ON files(folder, mtime)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_files_folder_size ON files(folder, size)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_files_name ON files(name)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_files_processing ON files(processing_state, mtime)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_files_model_scan ON files(model_scanned, path)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_files_model_status ON files(model_scanned, processing_state, path)")
@@ -361,6 +464,14 @@ class GalleryDB:
                     )
                 """)
                 self.has_fts = True
+                # FTS5's UNINDEXED path cannot serve equality lookups. Keep a
+                # normal indexed mapping, including any legacy duplicate rows.
+                # Rebuild this small mapping at startup from existing FTS data;
+                # this also supports rolling back to 1.2.14 and upgrading again.
+                conn.execute("CREATE TABLE IF NOT EXISTS gallery_search_paths (search_rowid INTEGER PRIMARY KEY, path TEXT NOT NULL)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_gallery_search_path ON gallery_search_paths(path)")
+                conn.execute("DELETE FROM gallery_search_paths")
+                conn.execute("INSERT INTO gallery_search_paths SELECT rowid, path FROM gallery_search")
             except sqlite3.OperationalError as e:
                 self.has_fts = False
                 print(f"[SEARCH] FTS5 unavailable; using legacy LIKE search ({e})")
@@ -403,11 +514,15 @@ class GalleryDB:
             discovery_batch.clear()
             with self.lock:
                 conn.executemany(self.DISCOVERY_UPSERT_SQL, batch)
+                self._refresh_folder_branches(conn, {row[1] for row in batch})
                 conn.commit()
+                self._mark_changed()
+            self._processing_wakeup.set()
 
         if force and self.has_fts:
             with self.lock:
                 conn.execute("DELETE FROM gallery_search")
+                conn.execute("DELETE FROM gallery_search_paths")
                 conn.commit()
             self.search_index_ready = False
             self._processing_rebuild_fts = True
@@ -482,6 +597,10 @@ class GalleryDB:
                         stale_paths = [path for path in existing_mtimes if path not in current_paths]
                         if stale_paths:
                             pruned_files += self._prune_file_records(conn, stale_paths)
+                    # Do not leave a SQLite write transaction open while doing
+                    # a directory's filesystem I/O outside the Python lock.
+                    conn.commit()
+                self._cleanup_pruned_thumbnails()
                 for fname in images:
                     fpath = os.path.join(dirpath, fname)
                     rel_from_root = os.path.relpath(fpath, root_abs).replace("\\", "/")
@@ -554,6 +673,8 @@ class GalleryDB:
             if force or queued_files or pruned_files or pruned_folders:
                 self._refresh_folder_aggregates(conn)
             conn.commit()
+        self._mark_changed()
+        self._cleanup_pruned_thumbnails()
         elapsed = time.time() - t0
         print(f"[INDEX] Discovery finished in {elapsed:.2f}s; {queued_files} files await background processing")
         if pruned_files or pruned_folders:
@@ -595,121 +716,120 @@ class GalleryDB:
             return root_name, root_abs, db_path
         return None
 
-    def _ensure_folder_chain(self, conn, root_name, root_abs, absolute_dir):
-        relative = os.path.relpath(absolute_dir, root_abs)
-        parts = [] if relative == "." else relative.replace("\\", "/").split("/")
+    def _ensure_folder_chain(self, conn, root_name, root_abs, absolute_dir, seen=None):
+        """Record known directory ancestors without enumerating their contents.
+
+        The watcher already knows the changed files. Counts/cover/subfolders
+        come from indexed rows, and the normal startup scan discovers unrelated
+        contents. Never scan the whole image directory for each incoming file.
+        """
+        seen = seen if seen is not None else set()
+        relative = os.path.relpath(absolute_dir, root_abs).replace("\\", "/")
+        parts = [] if relative == "." else relative.split("/")
         for depth in range(len(parts) + 1):
             current_parts = parts[:depth]
-            current_abs = os.path.join(root_abs, *current_parts) if current_parts else root_abs
-            if not os.path.isdir(current_abs):
+            current = root_name + ("/" + "/".join(current_parts) if current_parts else "")
+            if current in seen:
                 continue
-            current_path = root_name + ("/" + "/".join(current_parts) if current_parts else "")
-            parent = current_path.rsplit("/", 1)[0] if "/" in current_path else ""
-            try:
-                with os.scandir(current_abs) as entries:
-                    visible = [entry for entry in entries if not entry.name.startswith(".")]
-                images = [entry.name for entry in visible if entry.is_file() and Path(entry.name).suffix.lower() in IMAGE_EXTENSIONS]
-                has_subs = int(any(entry.is_dir() for entry in visible))
-                folder_mtime = os.path.getmtime(current_abs)
-            except OSError:
-                images = []
-                has_subs = 0
-                folder_mtime = 0
-            cover = current_path + "/" + images[0] if images else None
-            conn.execute("""
-                INSERT INTO folders (
-                    path, name, parent, file_count, has_subfolders,
-                    mtime, cover_image
-                ) VALUES (?,?,?,?,?,?,?)
-                ON CONFLICT(path) DO UPDATE SET
-                    name=excluded.name,
-                    parent=excluded.parent,
-                    file_count=excluded.file_count,
-                    has_subfolders=excluded.has_subfolders,
-                    mtime=excluded.mtime,
-                    cover_image=excluded.cover_image
-            """, (
-                current_path,
-                root_name if not current_parts else current_parts[-1],
-                parent,
-                len(images),
-                has_subs,
-                folder_mtime,
-                cover,
-            ))
+            seen.add(current)
+            parent = current.rsplit("/", 1)[0] if "/" in current else ""
+            conn.execute(
+                "INSERT OR IGNORE INTO folders(path,name,parent,mtime) VALUES (?,?,?,0)",
+                (current, current_parts[-1] if current_parts else root_name, parent),
+            )
 
     def sync_changed_paths(self, paths):
-        """Apply debounced filesystem events without walking every gallery root."""
+        """Coalesce disk events; observe disk outside locks and commit short batches."""
         conn = self._get_conn()
-        expanded = set(os.path.abspath(path) for path in paths if path)
+        expanded = {os.path.abspath(path) for path in paths if path}
         for path in list(expanded):
             lower = path.lower()
-            if lower.endswith("_meta.txt"):
-                base = path[:-9]
-            elif lower.endswith(".txt"):
-                base = path[:-4]
-            else:
-                continue
-            for extension in IMAGE_EXTENSIONS:
-                candidate = base + extension
-                if os.path.isfile(candidate):
-                    expanded.add(candidate)
+            base = path[:-9] if lower.endswith("_meta.txt") else path[:-4] if lower.endswith(".txt") else None
+            if base is not None:
+                for extension in IMAGE_EXTENSIONS:
+                    candidate = base + extension
+                    if os.path.isfile(candidate):
+                        expanded.add(candidate)
 
-        queued = removed = folder_changes = 0
-        affected_folders = set()
-        with self.lock:
-            for absolute_path in expanded:
-                mapped = self._map_absolute_path(absolute_path)
+        def observe():
+            for absolute in expanded:
+                mapped = self._map_absolute_path(absolute)
                 if not mapped:
                     continue
                 root_name, root_abs, db_path = mapped
-                extension = Path(absolute_path).suffix.lower()
-                if extension in IMAGE_EXTENSIONS:
-                    if os.path.isfile(absolute_path):
-                        try:
-                            stat = os.stat(absolute_path)
-                        except OSError:
-                            continue
-                        row = conn.execute("SELECT mtime FROM files WHERE path=?", (db_path,)).fetchone()
-                        if row and abs((row[0] or 0) - stat.st_mtime) < 0.01:
-                            continue
-                        self._ensure_folder_chain(conn, root_name, root_abs, os.path.dirname(absolute_path))
-                        folder = db_path.rsplit("/", 1)[0] if "/" in db_path else root_name
-                        affected_folders.add(folder)
-                        conn.execute(self.DISCOVERY_UPSERT_SQL, (
-                            db_path, folder, os.path.basename(absolute_path), extension,
-                            stat.st_size, stat.st_mtime,
-                        ))
-                        queued += 1
-                    else:
-                        if conn.execute("SELECT 1 FROM files WHERE path=?", (db_path,)).fetchone():
-                            affected_folders.add(db_path.rsplit("/", 1)[0] if "/" in db_path else root_name)
-                            removed += self._prune_file_records(conn, [db_path])
-                elif not os.path.exists(absolute_path):
-                    parent = db_path.rsplit("/", 1)[0] if "/" in db_path else ""
-                    if parent:
-                        affected_folders.add(parent)
-                    file_rows = conn.execute(
-                        "SELECT path FROM files WHERE folder=? OR folder LIKE ?",
-                        (db_path, db_path + "/%"),
-                    ).fetchall()
-                    if file_rows:
-                        removed += self._prune_file_records(conn, [row[0] for row in file_rows])
-                    cursor = conn.execute(
-                        "DELETE FROM folders WHERE path=? OR path LIKE ?",
-                        (db_path, db_path + "/%"),
-                    )
-                    if cursor.rowcount and cursor.rowcount > 0:
-                        folder_changes += cursor.rowcount
-            if queued or removed or folder_changes:
-                self._refresh_folder_branches(conn, affected_folders)
-                conn.commit()
+                relative = db_path.split("/")[1:]
+                if any(part.startswith(".") for part in relative):
+                    continue
+                with self._delete_lock:
+                    if db_path in self._delete_inflight:
+                        continue
+                extension = Path(absolute).suffix.lower()
+                try:
+                    stat = os.stat(absolute)
+                except FileNotFoundError:
+                    stat = None
+                except OSError:
+                    # A disconnected share/permission error is not a deletion.
+                    continue
+                if extension in IMAGE_EXTENSIONS and stat is not None and not os.path.isfile(absolute):
+                    continue
+                if extension in IMAGE_EXTENSIONS or stat is None:
+                    yield (absolute, root_name, root_abs, db_path, extension, stat)
+
+        queued = removed = folder_changes = 0
+        observations = iter(observe())
+        while True:
+            batch = list(islice(observations, 100))
+            if not batch:
+                break
+            changed_folders, gone, seen = set(), [], set()
+            with self.lock:
+                try:
+                    for absolute, root_name, root_abs, db_path, extension, stat in batch:
+                        with self._delete_lock:
+                            if db_path in self._delete_inflight:
+                                continue
+                        if extension in IMAGE_EXTENSIONS:
+                            row = conn.execute("SELECT mtime,size FROM files WHERE path=?", (db_path,)).fetchone()
+                            if stat is not None:
+                                if row and row[0] == stat.st_mtime and row[1] == stat.st_size:
+                                    continue
+                                self._ensure_folder_chain(conn, root_name, root_abs, os.path.dirname(absolute), seen)
+                                folder = db_path.rsplit("/", 1)[0]
+                                changed_folders.add(folder)
+                                conn.execute(self.DISCOVERY_UPSERT_SQL, (db_path, folder, os.path.basename(absolute), extension, stat.st_size, stat.st_mtime))
+                                queued += 1
+                            elif row:
+                                gone.append(db_path)
+                                changed_folders.add(db_path.rsplit("/", 1)[0])
+                        elif stat is None:
+                            # Only known directories can remove a subtree. An
+                            # unrelated missing sidecar is not a folder event.
+                            if not conn.execute("SELECT 1 FROM folders WHERE path=?", (db_path,)).fetchone():
+                                continue
+                            prefix = db_path + "/"
+                            gone.extend(row[0] for row in conn.execute(
+                                "SELECT path FROM files WHERE folder=? OR (folder>=? AND folder<?)",
+                                (db_path, prefix, prefix + chr(0x10ffff)),
+                            ))
+                            changed_folders.add(db_path.rsplit("/", 1)[0] if "/" in db_path else db_path)
+                            cursor = conn.execute("DELETE FROM folders WHERE path=? OR (path>=? AND path<?)", (db_path, prefix, prefix + chr(0x10ffff)))
+                            folder_changes += max(0, cursor.rowcount)
+                    if gone:
+                        removed += self._prune_file_records(conn, gone)
+                    if changed_folders:
+                        self._refresh_folder_branches(conn, changed_folders)
+                    conn.commit()
+                    if changed_folders:
+                        self._mark_changed()
+                except Exception:
+                    conn.rollback()
+                    raise
+            self._cleanup_pruned_thumbnails()
+            self._processing_wakeup.set()
         if queued or removed or folder_changes:
             self._search_cache = {}
             self._search_cache_key = None
-            if removed:
-                self._tag_counts_dirty.set()
-            self._processing_wakeup.set()
             print(f"[GALLERY] Filesystem sync: {queued} queued, {removed} removed")
         return {"queued": queued, "removed": removed, "folders": folder_changes}
 
@@ -834,6 +954,7 @@ class GalleryDB:
                 if not rows:
                     break
                 last_rowid = rows[-1][0]
+                generated_before = generated
                 for outcome in executor.map(process, [row[1] for row in rows]):
                     checked += 1
                     if outcome == "generated":
@@ -842,6 +963,8 @@ class GalleryDB:
                         skipped += 1
                     else:
                         errors += 1
+                if generated != generated_before:
+                    self._mark_changed()
                 report("generate", "Checking and generating thumbnails")
 
         elapsed = time.time() - started
@@ -873,8 +996,7 @@ class GalleryDB:
         self._tag_counts_dirty.clear()
 
     def processing_status(self):
-        conn = self._get_conn()
-        with self.lock:
+        with self._read_snapshot() as conn:
             total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             pending = conn.execute(
                 "SELECT COUNT(*) FROM files WHERE processing_state=0"
@@ -905,10 +1027,25 @@ class GalleryDB:
         if not file_path:
             return
         with self._processing_lock:
-            if file_path not in self._processing_priority_set:
+            if file_path not in self._processing_priority_set and file_path not in self._processing_claimed:
+                if len(self._processing_priority) >= 512:
+                    old = self._processing_priority.pop()
+                    self._processing_priority_set.discard(old)
+                    self._thumbnail_requests.discard(old)
                 self._processing_priority.appendleft(file_path)
                 self._processing_priority_set.add(file_path)
         self._processing_wakeup.set()
+
+    def request_thumbnail(self, file_path, mtime):
+        with self._processing_lock:
+            if self._thumbnail_failures.get(file_path) == mtime or file_path in self._processing_claimed:
+                return
+            self._thumbnail_requests.add(file_path)
+        self.prioritize_processing(file_path)
+
+    def thumbnail_state(self, file_path):
+        with self._read_snapshot() as conn:
+            return conn.execute("SELECT mtime,processing_state FROM files WHERE path=?", (file_path,)).fetchone()
 
     def pause_processing(self):
         self._processing_paused.set()
@@ -945,11 +1082,16 @@ class GalleryDB:
                 if path in self._processing_claimed:
                     continue
                 row = conn.execute(
-                    "SELECT processing_state FROM files WHERE path=?", (path,)
+                    "SELECT processing_state,mtime FROM files WHERE path=?", (path,)
                 ).fetchone()
+                thumbnail_requested = path in self._thumbnail_requests
+                self._thumbnail_requests.discard(path)
                 if row and row[0] == 0:
                     self._processing_claimed.add(path)
-                    return path
+                    return path, False
+                if row and thumbnail_requested and self._thumbnail_failures.get(path) != row[1]:
+                    self._processing_claimed.add(path)
+                    return path, True
             rows = conn.execute(
                 "SELECT path FROM files WHERE processing_state=0 ORDER BY mtime DESC LIMIT 128"
             ).fetchall()
@@ -957,67 +1099,107 @@ class GalleryDB:
                 path = row[0]
                 if path not in self._processing_claimed:
                     self._processing_claimed.add(path)
-                    return path
+                    return path, False
         return None
 
-    def _write_thumbnail_bytes(self, file_path, raw_data):
+    def _write_thumbnail_bytes(self, file_path, raw_data, source_mtime=None):
         if not HAS_PIL:
             return 0, 0
         abs_path = self.resolve_path(file_path)
         if not abs_path:
             return 0, 0
+        source_mtime = os.path.getmtime(abs_path) if source_mtime is None else source_mtime
         thumb_path = get_thumb_path(self.thumb_dir, file_path)
-        tmp_path = f"{thumb_path}.{threading.get_ident()}.tmp"
-        os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
-        with Image.open(BytesIO(raw_data)) as image:
-            width, height = image.size
-            image.thumbnail(THUMB_SIZE, LANCZOS)
-            if image.mode not in ("RGB", "L"):
-                image = image.convert("RGB")
-            image.save(tmp_path, "WEBP", quality=80, method=4)
-        os.replace(tmp_path, thumb_path)
+        with thumbnail_lock(file_path):
+            with Image.open(BytesIO(raw_data)) as image:
+                width, height = image.size
+                if thumbnail_is_current(thumb_path, source_mtime):
+                    return width, height
+                tmp_path = f"{thumb_path}.{threading.get_ident()}.tmp"
+                os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
+                try:
+                    image.thumbnail(THUMB_SIZE, LANCZOS)
+                    if image.mode not in ("RGB", "L"):
+                        image = image.convert("RGB")
+                    image.save(tmp_path, "WEBP", quality=80, method=4)
+                    os.utime(tmp_path, (source_mtime, source_mtime))
+                    os.replace(tmp_path, thumb_path)
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
         return width, height
 
     def _process_file(self, conn, file_path):
+        # Capture the queued source version before I/O. A copy still in progress
+        # or a replacement during decoding must not be marked as processed.
+        with self._read_snapshot() as reader:
+            expected = reader.execute("SELECT mtime,size FROM files WHERE path=?", (file_path,)).fetchone()
+        if not expected:
+            return
         abs_path = self.resolve_path(file_path)
-        if not abs_path or not os.path.isfile(abs_path):
-            raise FileNotFoundError(abs_path or file_path)
-        with open(abs_path, "rb") as handle:
-            raw_data = handle.read()
-        metadata = get_image_metadata(abs_path, raw_data=raw_data)
-        width = height = 0
-        if HAS_PIL:
-            width, height = self._write_thumbnail_bytes(file_path, raw_data)
-        model_name = self._model_from_meta(metadata)
-        family_key = self._model_family(model_name)[0]
-        metadata_json = json.dumps(metadata) if metadata else None
+        if not abs_path:
+            raise FileNotFoundError(file_path)
+        with thumbnail_lock(file_path):
+            before = os.stat(abs_path)
+            if (before.st_mtime, before.st_size) != expected:
+                raise _SourceChanged(abs_path)
+            with open(abs_path, "rb") as handle:
+                raw_data = handle.read()
+            metadata = get_image_metadata(abs_path, raw_data=raw_data)
+            width, height = self._write_thumbnail_bytes(file_path, raw_data, before.st_mtime)
+            after = os.stat(abs_path)
+            if (after.st_mtime_ns, after.st_size) != (before.st_mtime_ns, before.st_size):
+                raise _SourceChanged(abs_path)
+            model_name = self._model_from_meta(metadata)
+            family_key = self._model_family(model_name)[0]
+            metadata_json = json.dumps(metadata) if metadata else None
+            tags = " ".join(tag for tag, _ in self._extract_tags(metadata or {}))
+            search_text = self._search_text(os.path.basename(abs_path), metadata or {})
+            with self.lock:
+                current = conn.execute("SELECT folder,name,mtime,size FROM files WHERE path=?", (file_path,)).fetchone()
+                if not current or (current[2], current[3]) != expected:
+                    if not current:
+                        self._pending_thumb_cleanup.add(file_path)
+                    return
+                try:
+                    conn.execute("""
+                        UPDATE files SET width=?,height=?,has_metadata=?,metadata_json=?,
+                            processing_state=1,processing_error=NULL,processed_mtime=mtime,
+                            model_name=?,model_family=?,model_scanned=1 WHERE path=?
+                    """, (width,height,1 if metadata else 0,metadata_json,model_name,family_key,file_path))
+                    self._index_tags(conn, file_path, metadata)
+                    if self.has_fts:
+                        self._delete_search_many(conn, [file_path])
+                        cursor = conn.execute("INSERT INTO gallery_search(path,folder,name,tags,metadata) VALUES (?,?,?,?,?)", (file_path,current[0],current[1],tags,search_text))
+                        conn.execute("INSERT INTO gallery_search_paths(search_rowid,path) VALUES (?,?)", (cursor.lastrowid,file_path))
+                    conn.commit()
+                    self._mark_changed()
+                except Exception:
+                    conn.rollback()
+                    raise
 
-        with self.lock:
-            current = conn.execute(
-                "SELECT folder, name, metadata_json, width, height, mtime FROM files WHERE path=?",
-                (file_path,),
-            ).fetchone()
-            if not current:
-                return
-            replace_search = bool(current[2] or current[3] or current[4]) and not self._processing_rebuild_fts
-            conn.execute("""
-                UPDATE files SET
-                    width=?, height=?, has_metadata=?, metadata_json=?,
-                    processing_state=1, processing_error=NULL,
-                    processed_mtime=mtime, model_name=?, model_family=?,
-                    model_scanned=1
-                WHERE path=?
-            """, (
-                width, height, 1 if metadata else 0, metadata_json,
-                model_name, family_key, file_path,
-            ))
-            self._index_tags(conn, file_path, metadata)
-            self._index_search(
-                conn, file_path, current[0], current[1], metadata,
-                replace=replace_search,
-            )
-            conn.commit()
-        self._tag_counts_dirty.set()
+    def _process_thumbnail(self, conn, file_path):
+        with self._read_snapshot() as reader:
+            row = reader.execute("SELECT mtime FROM files WHERE path=?", (file_path,)).fetchone()
+        if not row:
+            return
+        abs_path = self.resolve_path(file_path)
+        with thumbnail_lock(file_path):
+            if not abs_path or not os.path.isfile(abs_path):
+                raise FileNotFoundError(file_path)
+            if os.path.getmtime(abs_path) != row[0]:
+                raise _SourceChanged(abs_path)
+            thumb = ensure_thumbnail(self.thumb_dir, file_path, abs_path)
+            if not thumb or thumb != get_thumb_path(self.thumb_dir, file_path):
+                raise RuntimeError("Thumbnail unavailable")
+            with self._read_snapshot() as reader:
+                exists = reader.execute("SELECT 1 FROM files WHERE path=?", (file_path,)).fetchone()
+            if not exists:
+                try:
+                    os.remove(thumb)
+                except OSError:
+                    pass
+            self._mark_changed()
 
     def _process_model_backfill_batch(self, conn, limit=100):
         if not self._model_backfill_lock.acquire(blocking=False):
@@ -1044,7 +1226,7 @@ class GalleryDB:
                     "UPDATE files SET model_name=?, model_family=?, model_scanned=1 WHERE path=?",
                     updates,
                 )
-                conn.commit()
+                conn.commit(); self._mark_changed()
             return len(updates)
         finally:
             self._model_backfill_lock.release()
@@ -1056,15 +1238,29 @@ class GalleryDB:
                 self._processing_wakeup.wait(0.5)
                 self._processing_wakeup.clear()
                 continue
-            file_path = self._claim_processing_file(conn)
-            if file_path:
+            claimed = self._claim_processing_file(conn)
+            if claimed:
+                file_path, thumbnail_only = claimed
                 with self._processing_lock:
                     self._processing_active += 1
                 ok = False
                 try:
-                    self._process_file(conn, file_path)
+                    if thumbnail_only:
+                        self._process_thumbnail(conn, file_path)
+                    else:
+                        self._process_file(conn, file_path)
                     ok = True
                 except Exception as exc:
+                    if isinstance(exc, _SourceChanged):
+                        self.sync_changed_paths([exc.path])
+                        continue
+                    if thumbnail_only:
+                        row = self.thumbnail_state(file_path)
+                        with self._processing_lock:
+                            if len(self._thumbnail_failures) >= 512:
+                                self._thumbnail_failures.pop(next(iter(self._thumbnail_failures)))
+                            self._thumbnail_failures[file_path] = row[0] if row else None
+                        continue
                     attempts = self._processing_failures.get(file_path, 0) + 1
                     self._processing_failures[file_path] = attempts
                     with self.lock:
@@ -1073,8 +1269,14 @@ class GalleryDB:
                             (2 if attempts >= 3 else 0, str(exc)[:500], file_path),
                         )
                         conn.commit()
+                        self._mark_changed()
                     if attempts >= 3:
                         print(f"[GALLERY] Background processing failed for {file_path}: {exc}")
+                    else:
+                        # A copy may have emitted its first filesystem event
+                        # before the image is readable. Do not spend all three
+                        # attempts on the same incomplete bytes in milliseconds.
+                        self._processing_stop.wait(0.5)
                 finally:
                     with self._processing_lock:
                         self._processing_active = max(0, self._processing_active - 1)
@@ -1082,6 +1284,8 @@ class GalleryDB:
                         if ok:
                             self._processing_session_done += 1
                             self._processing_failures.pop(file_path, None)
+                            self._thumbnail_failures.pop(file_path, None)
+                    self._cleanup_pruned_thumbnails()
                 continue
 
             backfilled = self._process_model_backfill_batch(conn)
@@ -1113,10 +1317,11 @@ class GalleryDB:
         with self.lock:
             try:
                 file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-                search_count = conn.execute("SELECT COUNT(*) FROM gallery_search").fetchone()[0]
+                search_count = conn.execute("SELECT COUNT(*) FROM gallery_search_paths").fetchone()[0]
+                pending_count = conn.execute("SELECT COUNT(*) FROM files WHERE processing_state=0").fetchone()[0]
             except sqlite3.OperationalError:
                 return
-        self.search_index_ready = (search_count == file_count)
+        self.search_index_ready = (search_count + pending_count >= file_count)
         if file_count and not self.search_index_ready and not self._search_index_notice_shown:
             print(
                 f"[SEARCH] Full-text search index is incomplete "
@@ -1134,8 +1339,6 @@ class GalleryDB:
           gallery requests can proceed between chunks.
         - Uses executemany() for batch INSERTs instead of one INSERT per row.
 
-        Expected throughput: ~10 000–40 000 rows/s on a typical machine,
-        so 37 000 files should finish in well under 10 seconds.
         """
         if not self.has_fts:
             return {"ok": False, "error": "FTS5 search is not available"}
@@ -1146,7 +1349,9 @@ class GalleryDB:
         with self.lock:
             total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             conn.execute("DELETE FROM gallery_search")
+            conn.execute("DELETE FROM gallery_search_paths")
             conn.commit()
+        self.search_index_ready = False
 
         CHUNK = 2000
         last_rowid = 0
@@ -1186,11 +1391,23 @@ class GalleryDB:
 
             # Batch-insert this chunk.
             with self.lock:
+                # Files may have changed/disappeared while parsing outside the
+                # lock. Only index the snapshot still present in the database.
+                valid = []
+                for row, values in zip(chunk_rows, batch):
+                    current = conn.execute("SELECT metadata_json FROM files WHERE path=?", (row[1],)).fetchone()
+                    if current and current[0] == row[4]:
+                        valid.append(values)
+                self._delete_search_many(conn, [values[0] for values in valid])
+                first_id = conn.execute("SELECT COALESCE(MAX(rowid),0)+1 FROM gallery_search").fetchone()[0]
                 conn.executemany(
-                    "INSERT INTO gallery_search(path, folder, name, tags, metadata) VALUES (?,?,?,?,?)",
-                    batch,
+                    "INSERT INTO gallery_search(rowid, path, folder, name, tags, metadata) VALUES (?,?,?,?,?,?)",
+                    [(first_id + i, *values) for i, values in enumerate(valid)],
                 )
+                conn.executemany("INSERT INTO gallery_search_paths(search_rowid,path) VALUES (?,?)",
+                                 [(first_id + i, values[0]) for i, values in enumerate(valid)])
                 conn.commit()
+                self._mark_changed()
 
             processed += len(chunk_rows)
             last_rowid = chunk_rows[-1][0]
@@ -1201,7 +1418,7 @@ class GalleryDB:
 
         self._search_cache = {}
         self._search_cache_key = None
-        self.search_index_ready = True
+        self._ensure_search_index()
         self._search_index_notice_shown = False
         elapsed = time.time() - t0
         print(f"[SEARCH] Full-text index rebuilt: {processed} files in {elapsed:.2f}s")
@@ -1253,19 +1470,16 @@ class GalleryDB:
         return tags
 
     def _index_tags(self, conn, file_path, meta):
-        """Extract tags from metadata and store in tags/file_tags tables."""
-        # Remove old tags for this file
+        old_ids = {row[0] for row in conn.execute("SELECT tag_id FROM file_tags WHERE file_path=?", (file_path,))}
         conn.execute("DELETE FROM file_tags WHERE file_path=?", (file_path,))
-        if not meta:
-            return
-        tags = self._extract_tags(meta)
-        for tag_name, tag_type in tags:
-            # Insert or get tag
-            conn.execute("INSERT OR IGNORE INTO tags (name, count) VALUES (?, 0)", (tag_name,))
-            row = conn.execute("SELECT id FROM tags WHERE name=?", (tag_name,)).fetchone()
-            if row:
-                conn.execute("INSERT OR IGNORE INTO file_tags (file_path, tag_id, tag_type) VALUES (?,?,?)",
-                             (file_path, row[0], tag_type))
+        for tag_name, tag_type in dict(self._extract_tags(meta or {})).items():
+            conn.execute("INSERT OR IGNORE INTO tags(name, count) VALUES (?, 0)", (tag_name,))
+            tag_id = conn.execute("SELECT id FROM tags WHERE name=?", (tag_name,)).fetchone()[0]
+            conn.execute("INSERT OR IGNORE INTO file_tags(file_path, tag_id, tag_type) VALUES (?,?,?)", (file_path, tag_id, tag_type))
+        new_ids = {row[0] for row in conn.execute("SELECT tag_id FROM file_tags WHERE file_path=?", (file_path,))}
+        conn.executemany("UPDATE tags SET count=count+1 WHERE id=?", [(i,) for i in new_ids - old_ids])
+        conn.executemany("UPDATE tags SET count=MAX(0,count-1) WHERE id=?", [(i,) for i in old_ids - new_ids])
+        conn.executemany("DELETE FROM tags WHERE id=? AND NOT EXISTS (SELECT 1 FROM file_tags WHERE tag_id=tags.id)", [(i,) for i in old_ids - new_ids])
 
     @staticmethod
     def _flatten_metadata_values(value, out, limit=1200):
@@ -1324,15 +1538,14 @@ class GalleryDB:
         tags = " ".join(tag for tag, _tag_type in self._extract_tags(meta or {}))
         metadata = self._search_text(name, meta or {})
         try:
-            # `path` is UNINDEXED in FTS5, so DELETE WHERE path=? is a full-table
-            # scan — O(n) per call, O(n^2) over a full rebuild. Callers that just
-            # cleared the table (rebuild) pass replace=False to skip it.
-            if replace:
-                conn.execute("DELETE FROM gallery_search WHERE path=?", (file_path,))
-            conn.execute(
+            # Always replace by indexed ID, including a new file that a search
+            # rebuild may already have inserted while it was being processed.
+            self._delete_search_many(conn, [file_path])
+            cursor = conn.execute(
                 "INSERT INTO gallery_search(path, folder, name, tags, metadata) VALUES (?,?,?,?,?)",
                 (file_path, folder, name or "", tags, metadata)
             )
+            conn.execute("INSERT INTO gallery_search_paths(search_rowid,path) VALUES (?,?)", (cursor.lastrowid, file_path))
         except sqlite3.OperationalError as e:
             self.has_fts = False
             print(f"[SEARCH] FTS index disabled after error: {e}")
@@ -1471,53 +1684,46 @@ class GalleryDB:
         return ""
 
     def _delete_search(self, conn, file_path):
-        if self.has_fts:
-            try:
-                conn.execute("DELETE FROM gallery_search WHERE path=?", (file_path,))
-            except sqlite3.OperationalError:
-                pass
+        self._delete_search_many(conn, [file_path])
 
     def _delete_search_many(self, conn, paths):
-        """Delete many FTS rows with one scan per chunk.
-
-        `path` is UNINDEXED in the FTS5 table, so `DELETE ... WHERE path=?`
-        scans the whole FTS table. Doing that once per pruned file made the
-        final deleted-file pass crawl on large libraries. A single `IN (...)`
-        statement still scans, but only once for hundreds of paths.
-        """
+        """Delete by indexed FTS rowid, with work proportional to changed files."""
         if not self.has_fts:
             return
-        paths = list(paths)
-        CHUNK = 500  # stay comfortably below SQLite's common 999 variable limit
-        try:
-            for i in range(0, len(paths), CHUNK):
-                sub = paths[i:i + CHUNK]
-                if not sub:
-                    continue
-                placeholders = ",".join("?" for _ in sub)
-                conn.execute(f"DELETE FROM gallery_search WHERE path IN ({placeholders})", sub)
-        except sqlite3.OperationalError:
-            pass
+        paths = list(dict.fromkeys(paths))
+        for offset in range(0, len(paths), 500):
+            batch = paths[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            conn.execute(
+                f"DELETE FROM gallery_search WHERE rowid IN (SELECT search_rowid FROM gallery_search_paths WHERE path IN ({placeholders}))",
+                batch,
+            )
+            conn.execute(f"DELETE FROM gallery_search_paths WHERE path IN ({placeholders})", batch)
 
     def _prune_file_records(self, conn, paths):
-        """Remove DB/search/thumb records for files that no longer exist on disk."""
-        paths = list(paths)
-        if not paths:
-            return 0
-        conn.executemany("DELETE FROM file_tags WHERE file_path=?", [(p,) for p in paths])
-        conn.executemany("DELETE FROM file_collections WHERE file_path=?", [(p,) for p in paths])
-        self._delete_search_many(conn, paths)
-        conn.executemany("DELETE FROM files WHERE path=?", [(p,) for p in paths])
-        pruned = 0
-        for p in paths:
-            thumb = get_thumb_path(self.thumb_dir, p)
-            if os.path.exists(thumb):
-                try:
-                    os.remove(thumb)
-                except Exception:
-                    pass
-            pruned += 1
-        return pruned
+        """Remove records; defer thumbnail disk I/O until after the commit."""
+        paths = list(dict.fromkeys(paths))
+        for offset in range(0, len(paths), 250):
+            batch = paths[offset:offset + 250]
+            placeholders = ",".join("?" for _ in batch)
+            tag_ids = [row[0] for row in conn.execute(
+                f"SELECT DISTINCT tag_id FROM file_tags WHERE file_path IN ({placeholders})", batch
+            )]
+            conn.executemany("DELETE FROM file_tags WHERE file_path=?", [(path,) for path in batch])
+            conn.executemany("DELETE FROM file_collections WHERE file_path=?", [(path,) for path in batch])
+            self._delete_search_many(conn, batch)
+            conn.executemany("DELETE FROM files WHERE path=?", [(path,) for path in batch])
+            self._refresh_changed_tags(conn, tag_ids)
+            self._pending_thumb_cleanup.update(batch)
+        return len(paths)
+
+    @staticmethod
+    def _refresh_changed_tags(conn, tag_ids):
+        # Recount only affected tags, so counts are also correct for an older
+        # database whose last background tag-count pass did not finish.
+        ids = [(tag_id,) for tag_id in set(tag_ids)]
+        conn.executemany("UPDATE tags SET count=(SELECT COUNT(*) FROM file_tags WHERE tag_id=tags.id) WHERE id=?", ids)
+        conn.executemany("DELETE FROM tags WHERE id=? AND count=0", ids)
 
     def _prune_missing_folders(self, conn, scanned_roots):
         """Remove folders that are in SQLite but no longer exist on disk.
@@ -1602,34 +1808,26 @@ class GalleryDB:
         return pruned_files, pruned_folders
 
     def _prune_empty_folder_records(self, conn, candidate_folders):
-        """Remove indexed folder branches that no longer contain indexed images."""
+        """Prune bottom-up using cached child counts, not a library-wide LIKE."""
+        self._refresh_folder_branches(conn, candidate_folders)
         candidates = set()
-        for folder in candidate_folders or []:
-            folder = (folder or "").strip("/")
+        for folder in candidate_folders:
             while folder:
                 candidates.add(folder)
-                if "/" not in folder:
-                    break
-                folder = folder.rsplit("/", 1)[0]
-        pruned = 0
-        for folder in sorted(candidates, key=len, reverse=True):
-            has_files = conn.execute(
-                "SELECT 1 FROM files WHERE folder=? OR folder LIKE ? LIMIT 1",
-                (folder, folder + "/%")
-            ).fetchone()
-            if has_files:
+                folder = folder.rsplit("/", 1)[0] if "/" in folder else ""
+        removed = 0
+        for folder in sorted(candidates, key=lambda p: p.count("/"), reverse=True):
+            # Keep configured roots; their names must remain available for new
+            # files even when temporarily empty.
+            if folder in self.roots:
                 continue
-            cur = conn.execute(
-                "DELETE FROM folders WHERE path=? OR path LIKE ?",
-                (folder, folder + "/%")
-            )
-            pruned += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
-        return pruned
+            cursor = conn.execute("DELETE FROM folders WHERE path=? AND subtree_file_count=0", (folder,))
+            removed += max(0, cursor.rowcount)
+        return removed
 
     def get_subfolders(self, parent="", sort="name", active_path=""):
-        conn = self._get_conn()
         sort = (sort or "name").lower()
-        with self.lock:
+        with self._read_snapshot() as conn:
             rows = conn.execute("""
                 SELECT
                     f.path,
@@ -1665,7 +1863,6 @@ class GalleryDB:
         return items
 
     def get_files(self, folder="", sort="name", order="asc", page=1, per_page=DEFAULT_PER_PAGE, favorite_only=False, time_filter=None, include_model_info=False, metadata_filter="all"):
-        conn = self._get_conn()
         sort_col = {"name": "name", "date": "mtime", "size": "size", "favorite": "favorite"}.get(sort, "name")
         # Favorite sort: favorites first, then by date
         if sort == "favorite":
@@ -1702,20 +1899,20 @@ class GalleryDB:
                 params.append(cutoff)
         where_sql = " AND ".join(where) if where else "1=1"
         metadata_col = ", model_name, model_family" if include_model_info else ""
-        with self.lock:
+        view_revision = self.revision
+        with self._read_snapshot() as conn:
             total = conn.execute(f"SELECT COUNT(*) FROM files WHERE {where_sql}", params).fetchone()[0]
             rows = conn.execute(
                 f"SELECT path, name, folder, ext, size, mtime, width, height, has_metadata, favorite, processing_state{metadata_col} FROM files WHERE {where_sql} ORDER BY {order_clause} LIMIT ? OFFSET ?",
                 params + [per_page, offset]).fetchall()
         pages = max(1, (total + per_page - 1) // per_page)
         return {
-            "files": [self._file_dict(r, include_model_info) for r in rows],
+            "revision": view_revision, "files": [self._file_dict(r, include_model_info) for r in rows],
             "total": total, "page": page, "pages": pages, "per_page": per_page
         }
 
     def get_timeline_files(self, time_filter="today", sort="date", order="desc", page=1, per_page=DEFAULT_PER_PAGE, include_model_info=False, metadata_filter="all"):
         """Get files across all folders filtered by time."""
-        conn = self._get_conn()
         now = time.time()
         cutoffs = {"today": 86400, "7days": 7*86400, "30days": 30*86400}
         cutoff = now - cutoffs.get(time_filter, 86400)
@@ -1729,20 +1926,20 @@ class GalleryDB:
         if metadata_where:
             where.append(metadata_where)
         where_sql = " AND ".join(where)
-        with self.lock:
+        view_revision = self.revision
+        with self._read_snapshot() as conn:
             total = conn.execute(f"SELECT COUNT(*) FROM files WHERE {where_sql}", params).fetchone()[0]
             rows = conn.execute(
                 f"SELECT path, name, folder, ext, size, mtime, width, height, has_metadata, favorite, processing_state{metadata_col} FROM files WHERE {where_sql} ORDER BY {sort_col} {order_dir} LIMIT ? OFFSET ?",
                 params + [per_page, offset]).fetchall()
         pages = max(1, (total + per_page - 1) // per_page)
         return {
-            "files": [self._file_dict(r, include_model_info) for r in rows],
+            "revision": view_revision, "files": [self._file_dict(r, include_model_info) for r in rows],
             "total": total, "page": page, "pages": pages, "per_page": per_page
         }
 
     def get_all_favorites(self, sort="date", order="desc", page=1, per_page=DEFAULT_PER_PAGE, include_model_info=False, metadata_filter="all"):
         """Get all favorites across all folders."""
-        conn = self._get_conn()
         sort_col = {"name": "name", "date": "mtime", "size": "size"}.get(sort, "mtime")
         order_dir = "DESC" if order == "desc" else "ASC"
         offset = (page - 1) * per_page
@@ -1752,14 +1949,15 @@ class GalleryDB:
         if metadata_where:
             where.append(metadata_where)
         where_sql = " AND ".join(where)
-        with self.lock:
+        view_revision = self.revision
+        with self._read_snapshot() as conn:
             total = conn.execute(f"SELECT COUNT(*) FROM files WHERE {where_sql}").fetchone()[0]
             rows = conn.execute(
                 f"SELECT path, name, folder, ext, size, mtime, width, height, has_metadata, favorite, processing_state{metadata_col} FROM files WHERE {where_sql} ORDER BY {sort_col} {order_dir} LIMIT ? OFFSET ?",
                 (per_page, offset)).fetchall()
         pages = max(1, (total + per_page - 1) // per_page)
         return {
-            "files": [self._file_dict(r, include_model_info) for r in rows],
+            "revision": view_revision, "files": [self._file_dict(r, include_model_info) for r in rows],
             "total": total, "page": page, "pages": pages, "per_page": per_page
         }
 
@@ -1771,15 +1969,14 @@ class GalleryDB:
             if not row: return None
             new_val = 0 if row[0] else 1
             conn.execute("UPDATE files SET favorite=? WHERE path=?", (new_val, rel_path))
-            conn.commit()
+            conn.commit(); self._mark_changed()
         return {"path": rel_path, "favorite": bool(new_val)}
 
     def get_file_metadata(self, rel_path):
-        conn = self._get_conn()
-        with self.lock:
+        with self._read_snapshot() as conn:
             row = conn.execute("""
                 SELECT metadata_json, width, height, size, name, ext,
-                       processing_state, processing_error, folder
+                       processing_state, processing_error, folder, mtime
                 FROM files WHERE path=?
             """, (rel_path,)).fetchone()
         if not row: return None
@@ -1790,6 +1987,7 @@ class GalleryDB:
             "name": row[4], "ext": row[5], "gallery_path": rel_path,
             "folder": row[8] or "", "folder_path": os.path.dirname(absolute_path) if absolute_path else "",
             "absolute_path": absolute_path,
+            "mtime": row[9],
         }
         parsed = {}
         if "parameters" in meta_raw and "prompt" in meta_raw:
@@ -1820,8 +2018,7 @@ class GalleryDB:
         }
 
     def get_stats(self):
-        conn = self._get_conn()
-        with self.lock:
+        with self._read_snapshot() as conn:
             files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             with_metadata = conn.execute(
                 "SELECT COUNT(*) FROM files WHERE has_metadata=1"
@@ -1853,6 +2050,7 @@ class GalleryDB:
             "processing_active": active,
             "processing_paused": paused,
             "scan": self.scan_status(),
+            "revision": self.revision,
         }
 
     # Search result cache: query_key -> list of file paths
@@ -1861,7 +2059,6 @@ class GalleryDB:
 
     def search(self, query, page=1, per_page=DEFAULT_PER_PAGE, sort="date", order="desc", include_model_info=False, metadata_filter="all"):
         """Global search using the full-text index, with legacy LIKE fallback."""
-        conn = self._get_conn()
         sort_col = {"name": "name", "date": "mtime", "size": "size"}.get(sort, "mtime")
         order_dir = "DESC" if order == "desc" else "ASC"
         fts_query = self._fts_query(query)
@@ -1871,7 +2068,8 @@ class GalleryDB:
         metadata_where = self._metadata_filter_sql(metadata_filter, "f")
         metadata_clause = f" AND {metadata_where}" if metadata_where else ""
 
-        with self.lock:
+        view_revision = self.revision
+        with self._read_snapshot() as conn:
             fts_error = None
             try:
                 total = conn.execute(
@@ -1915,12 +2113,11 @@ class GalleryDB:
         pages = max(1, (total + per_page - 1) // per_page)
         files = [self._file_dict(r, include_model_info) for r in rows]
         folders = [{"path": r[0], "name": folder_info.get(r[0], r[0] or "Root"), "count": r[1]} for r in folder_rows]
-        return {"files": files, "total": total, "page": page, "pages": pages,
+        return {"revision": view_revision, "files": files, "total": total, "page": page, "pages": pages,
                 "per_page": per_page, "folders": folders, "query": query}
 
     def _search_like(self, query, page=1, per_page=DEFAULT_PER_PAGE, sort="date", order="desc", include_model_info=False, metadata_filter="all"):
         """Legacy global search: tags + filename first, metadata_json LIKE only if needed."""
-        conn = self._get_conn()
         sort_col = {"name": "name", "date": "mtime", "size": "size"}.get(sort, "mtime")
         order_dir = "DESC" if order == "desc" else "ASC"
         like = f"%{query.lower()}%"
@@ -1929,10 +2126,12 @@ class GalleryDB:
         metadata_where = self._metadata_filter_sql(metadata_filter)
         metadata_clause = f" AND {metadata_where}" if metadata_where else ""
 
-        with self.lock:
-            # Check if we have cached results for this exact query+sort
-            if self._search_cache_key == cache_key and self._search_cache.get("paths"):
-                cached = self._search_cache
+        revision = self.revision
+        cache = self._legacy_search_cache
+        view_revision = self.revision
+        with self._read_snapshot() as conn:
+            if cache and cache[:2] == (cache_key, revision):
+                cached = cache[2]
             else:
                 # Tier 1: tags + filename (fast, indexed)
                 fast_where = """(files.path IN (
@@ -1962,8 +2161,9 @@ class GalleryDB:
                     f"SELECT path FROM files WHERE {use_where} ORDER BY {sort_col} {order_dir}",
                     use_params).fetchall()
                 cached = {"paths": [r[0] for r in all_paths], "where": use_where, "params": use_params}
-                self._search_cache = cached
-                self._search_cache_key = cache_key
+                with self._revision_lock:
+                    if self._revision == revision:
+                        self._legacy_search_cache = (cache_key, revision, cached)
 
             # Paginate from cached paths
             total = len(cached["paths"])
@@ -1992,12 +2192,11 @@ class GalleryDB:
         pages = max(1, (total + per_page - 1) // per_page)
         files = [self._file_dict(r, include_model_info) for r in rows]
         folders = [{"path": r[0], "name": folder_info.get(r[0], r[0] or "Root"), "count": r[1]} for r in folder_rows]
-        return {"files": files, "total": total, "page": page, "pages": pages,
+        return {"revision": view_revision, "files": files, "total": total, "page": page, "pages": pages,
                 "per_page": per_page, "folders": folders, "query": query}
 
     def search_in_folder(self, query, folder, page=1, per_page=DEFAULT_PER_PAGE, sort="date", order="desc", include_model_info=False, metadata_filter="all"):
         """Search within a folder and its subfolders using FTS when available."""
-        conn = self._get_conn()
         fts_query = self._fts_query(query)
         if not self.has_fts or not self.search_index_ready or not fts_query:
             return self._search_in_folder_like(query, folder, page, per_page, sort, order, include_model_info, metadata_filter)
@@ -2008,7 +2207,8 @@ class GalleryDB:
         metadata_where = self._metadata_filter_sql(metadata_filter, "f")
         metadata_clause = f" AND {metadata_where}" if metadata_where else ""
 
-        with self.lock:
+        view_revision = self.revision
+        with self._read_snapshot() as conn:
             fts_error = None
             try:
                 where_folder = "(s.folder=? OR s.folder LIKE ?)"
@@ -2037,11 +2237,10 @@ class GalleryDB:
 
         pages = max(1, (total + per_page - 1) // per_page)
         files = [self._file_dict(r, include_model_info) for r in rows]
-        return {"files": files, "total": total, "page": page, "pages": pages, "per_page": per_page}
+        return {"revision": view_revision, "files": files, "total": total, "page": page, "pages": pages, "per_page": per_page}
 
     def _search_in_folder_like(self, query, folder, page=1, per_page=DEFAULT_PER_PAGE, sort="date", order="desc", include_model_info=False, metadata_filter="all"):
         """Legacy folder search. Tags first, LIKE fallback."""
-        conn = self._get_conn()
         like = f"%{query.lower()}%"
         folder_like = folder + "/%" if folder else "%"
         sort_col = {"name": "name", "date": "mtime", "size": "size"}.get(sort, "mtime")
@@ -2050,7 +2249,8 @@ class GalleryDB:
         metadata_where = self._metadata_filter_sql(metadata_filter)
         metadata_clause = f" AND {metadata_where}" if metadata_where else ""
 
-        with self.lock:
+        view_revision = self.revision
+        with self._read_snapshot() as conn:
             # Tier 1: tags + filename
             fast_where = """(folder=? OR folder LIKE ?) AND (
                 files.path IN (
@@ -2082,12 +2282,11 @@ class GalleryDB:
 
         pages = max(1, (total + per_page - 1) // per_page)
         files = [self._file_dict(r, include_model_info) for r in rows]
-        return {"files": files, "total": total, "page": page, "pages": pages, "per_page": per_page}
+        return {"revision": view_revision, "files": files, "total": total, "page": page, "pages": pages, "per_page": per_page}
 
     def get_tags(self, prefix="", limit=50):
         """Autocomplete: get tags matching prefix, sorted by frequency."""
-        conn = self._get_conn()
-        with self.lock:
+        with self._read_snapshot() as conn:
             if prefix:
                 rows = conn.execute("SELECT name, count FROM tags WHERE name LIKE ? ORDER BY count DESC LIMIT ?",
                                     (f"%{prefix.lower()}%", limit)).fetchall()
@@ -2097,8 +2296,7 @@ class GalleryDB:
 
     def get_without_metadata_paths(self):
         """Return completed images that contain no generation metadata."""
-        conn = self._get_conn()
-        with self.lock:
+        with self._read_snapshot() as conn:
             rows = conn.execute(
                 """SELECT path FROM files
                    WHERE processing_state=1 AND has_metadata=0
@@ -2107,64 +2305,67 @@ class GalleryDB:
         return [row[0] for row in rows]
 
     def count_without_metadata(self):
-        conn = self._get_conn()
-        with self.lock:
+        with self._read_snapshot() as conn:
             return conn.execute(
                 "SELECT COUNT(*) FROM files WHERE processing_state=1 AND has_metadata=0"
             ).fetchone()[0]
 
     def delete_files(self, rel_paths, progress=None):
-        """Move files to trash and remove their Gallery records in one batch."""
-        conn = self._get_conn()
-        results = []
-        affected_folders = set()
-        successful_paths = []
+        """Trash off-lock; commit successful files in small, indexed batches."""
         paths = list(dict.fromkeys(p for p in rel_paths if isinstance(p, str) and p))
-        total = len(paths)
-        ok_count = 0
-        failed_count = 0
-        for index, rel_path in enumerate(paths, 1):
-            full_path = self.resolve_path(rel_path)
-            if not full_path or not os.path.isfile(full_path):
-                results.append({"path": rel_path, "ok": False, "error": "File not found"})
-                failed_count += 1
-                if progress:
-                    progress(index, total, ok_count, failed_count, "trash", rel_path)
-                continue
-            try:
-                if HAS_TRASH:
-                    send2trash(full_path)
-                else:
-                    os.remove(full_path)
-                successful_paths.append(rel_path)
-                affected_folders.add(os.path.dirname(rel_path))
-                results.append({"path": rel_path, "ok": True})
-                ok_count += 1
-                log_debug(f"Deleted: {rel_path}")
-            except Exception as e:
-                results.append({"path": rel_path, "ok": False, "error": str(e)})
-                failed_count += 1
-                log_debug(f"Delete failed for {rel_path}: {e}")
-            if progress:
-                progress(index, total, ok_count, failed_count, "trash", rel_path)
+        if not HAS_TRASH:
+            return [{"path": p, "ok": False, "error": "Safe delete requires send2trash"} for p in paths]
+        conn = self._get_conn()
+        results, pending = [], []
+        ok_count = failed_count = 0
+        with self._delete_lock:
+            self._delete_inflight.update(paths)
 
-        if successful_paths:
-            if progress:
-                progress(total, total, ok_count, failed_count, "database", "")
+        def flush():
+            if not pending:
+                return
+            folders = {p.rsplit("/", 1)[0] for p in pending}
             with self.lock:
-                self._prune_file_records(conn, successful_paths)
-                for folder in affected_folders:
-                    conn.execute(
-                        "UPDATE folders SET file_count = (SELECT COUNT(*) FROM files WHERE folder=?) WHERE path=?",
-                        (folder, folder),
-                    )
-                pruned_folders = self._prune_empty_folder_records(conn, affected_folders)
-                if pruned_folders:
-                    print(f"[DELETE] Pruned {pruned_folders} empty folder records")
-                self._refresh_folder_branches(conn, affected_folders)
-                conn.execute("UPDATE tags SET count = (SELECT COUNT(*) FROM file_tags WHERE file_tags.tag_id = tags.id)")
-                conn.execute("DELETE FROM tags WHERE count = 0")
-                conn.commit()
+                try:
+                    self._prune_file_records(conn, pending)
+                    self._prune_empty_folder_records(conn, folders)
+                    self._refresh_folder_branches(conn, folders)
+                    conn.commit()
+                    self._mark_changed()
+                except Exception:
+                    conn.rollback()
+                    raise
+            pending.clear()
+            self._cleanup_pruned_thumbnails()
+
+        try:
+            for index, rel_path in enumerate(paths, 1):
+                try:
+                    full_path = self.resolve_path(rel_path)
+                    if not full_path or not os.path.isfile(full_path):
+                        raise FileNotFoundError("File not found")
+                    with thumbnail_lock(rel_path):
+                        send2trash(full_path)
+                    pending.append(rel_path)
+                    results.append({"path": rel_path, "ok": True})
+                    ok_count += 1
+                except Exception as exc:
+                    results.append({"path": rel_path, "ok": False, "error": str(exc)})
+                    failed_count += 1
+                if progress:
+                    progress(index, len(paths), ok_count, failed_count, "trash", rel_path)
+                if len(pending) >= 100:
+                    flush()
+            if progress and pending:
+                progress(len(paths), len(paths), ok_count, failed_count, "database", "")
+            flush()
+        finally:
+            with self._delete_lock:
+                self._delete_inflight.difference_update(paths)
+            # Reconcile events skipped while deleting, including failed trash
+            # moves or a file recreated at the same path during the operation.
+            absolute = [self.resolve_path(p) for p in paths]
+            self.sync_changed_paths([p for p in absolute if p])
         self._search_cache = {}
         self._search_cache_key = None
         return results
@@ -2177,10 +2378,11 @@ class GalleryDB:
             try:
                 conn.execute("INSERT INTO collections (name, color, created) VALUES (?,?,?)",
                              (name.strip(), color, time.time()))
-                conn.commit()
+                conn.commit(); self._mark_changed()
                 row = conn.execute("SELECT id, name, color, created FROM collections WHERE name=?", (name.strip(),)).fetchone()
                 return {"id": row[0], "name": row[1], "color": row[2], "count": 0}
             except sqlite3.IntegrityError:
+                conn.rollback()
                 return {"error": "Collection already exists"}
 
     def rename_collection(self, collection_id, new_name):
@@ -2188,9 +2390,10 @@ class GalleryDB:
         with self.lock:
             try:
                 conn.execute("UPDATE collections SET name=? WHERE id=?", (new_name.strip(), collection_id))
-                conn.commit()
+                conn.commit(); self._mark_changed()
                 return {"ok": True}
             except sqlite3.IntegrityError:
+                conn.rollback()
                 return {"error": "Name already taken"}
 
     def delete_collection(self, collection_id):
@@ -2198,12 +2401,11 @@ class GalleryDB:
         with self.lock:
             conn.execute("DELETE FROM file_collections WHERE collection_id=?", (collection_id,))
             conn.execute("DELETE FROM collections WHERE id=?", (collection_id,))
-            conn.commit()
+            conn.commit(); self._mark_changed()
         return {"ok": True}
 
     def get_collections(self):
-        conn = self._get_conn()
-        with self.lock:
+        with self._read_snapshot() as conn:
             rows = conn.execute("""
                 SELECT c.id, c.name, c.color, c.created, COUNT(fc.file_path) as cnt
                 FROM collections c
@@ -2223,7 +2425,7 @@ class GalleryDB:
                                  (p, collection_id, now))
                     added += 1
                 except Exception: pass
-            conn.commit()
+            conn.commit(); self._mark_changed()
         return {"added": added}
 
     def remove_from_collection(self, collection_id, paths):
@@ -2231,18 +2433,18 @@ class GalleryDB:
         with self.lock:
             for p in paths:
                 conn.execute("DELETE FROM file_collections WHERE file_path=? AND collection_id=?", (p, collection_id))
-            conn.commit()
+            conn.commit(); self._mark_changed()
         return {"removed": len(paths)}
 
     def get_collection_files(self, collection_id, sort="date", order="desc", page=1, per_page=DEFAULT_PER_PAGE, include_model_info=False, metadata_filter="all"):
-        conn = self._get_conn()
         sort_col = {"name": "f.name", "date": "fc.added", "size": "f.size"}.get(sort, "fc.added")
         order_dir = "DESC" if order == "desc" else "ASC"
         offset = (page - 1) * per_page
         metadata_col = ", f.model_name, f.model_family" if include_model_info else ""
         metadata_where = self._metadata_filter_sql(metadata_filter, "f")
         metadata_clause = f" AND {metadata_where}" if metadata_where else ""
-        with self.lock:
+        view_revision = self.revision
+        with self._read_snapshot() as conn:
             total = conn.execute(
                 f"SELECT COUNT(*) FROM file_collections fc JOIN files f ON fc.file_path = f.path WHERE fc.collection_id=?{metadata_clause}",
                 (collection_id,)).fetchone()[0]
@@ -2253,14 +2455,13 @@ class GalleryDB:
                 (collection_id, per_page, offset)).fetchall()
         pages = max(1, (total + per_page - 1) // per_page)
         return {
-            "files": [self._file_dict(r, include_model_info) for r in rows],
+            "revision": view_revision, "files": [self._file_dict(r, include_model_info) for r in rows],
             "total": total, "page": page, "pages": pages, "per_page": per_page
         }
 
     def get_file_collections(self, file_path):
         """Get which collections a file belongs to."""
-        conn = self._get_conn()
-        with self.lock:
+        with self._read_snapshot() as conn:
             rows = conn.execute("""
                 SELECT c.id, c.name, c.color FROM collections c
                 JOIN file_collections fc ON c.id = fc.collection_id
@@ -2303,26 +2504,33 @@ def migrate_thumb_layout(thumb_dir):
     print(f"[MIGRATE] Done. {moved} thumbnails moved to {len(set(f[:2] for f in flat_files))} subfolders.")
 
 def ensure_thumbnail(thumb_dir, db_path, abs_path):
-    """Generate thumbnail if needed. Returns thumb path or fallback to original."""
-    if not abs_path or not os.path.isfile(abs_path):
+    if not HAS_PIL or not abs_path:
         return None
-    thumb_path = get_thumb_path(thumb_dir, db_path)
-    if os.path.exists(thumb_path):
-        src_mtime = os.path.getmtime(abs_path)
-        th_mtime = os.path.getmtime(thumb_path)
-        if th_mtime >= src_mtime:
-            return thumb_path
-    if not HAS_PIL:
-        return abs_path
-    try:
-        os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
-        with Image.open(abs_path) as img:
-            img.thumbnail(THUMB_SIZE, LANCZOS)
-            img.save(thumb_path, "WEBP", quality=80)
-        return thumb_path
-    except Exception as e:
-        log_debug(f"Thumbnail generation failed: {e}")
-        return abs_path
+    with thumbnail_lock(db_path):
+        thumb = get_thumb_path(thumb_dir, db_path)
+        temporary = f"{thumb}.{threading.get_ident()}.tmp"
+        try:
+            before = os.stat(abs_path)
+            if thumbnail_is_current(thumb, before.st_mtime):
+                return thumb
+            os.makedirs(os.path.dirname(thumb), exist_ok=True)
+            with Image.open(abs_path) as image:
+                image.thumbnail(THUMB_SIZE, LANCZOS)
+                if image.mode not in ("RGB", "L"):
+                    image = image.convert("RGB")
+                image.save(temporary, "WEBP", quality=80, method=4)
+            after = os.stat(abs_path)
+            if (after.st_mtime_ns, after.st_size) != (before.st_mtime_ns, before.st_size):
+                return None
+            os.utime(temporary, (before.st_mtime, before.st_mtime))
+            os.replace(temporary, thumb)
+            return thumb
+        except (OSError, ValueError) as exc:
+            log_debug(f"Thumbnail generation failed: {exc}")
+            return None
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
 
 # (old ensure_thumbnail removed — using new version above)
 
@@ -2546,6 +2754,7 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 .gallery-grid.masonry > .thumb-card { aspect-ratio:auto; transition:border-color .15s, box-shadow .15s, transform .15s; }
 .gallery-grid.masonry > .gallery-group-header { margin:0; }
 .gallery-grid.masonry .thumb-card img { object-fit:contain; }
+.thumb-card.delete-pending { opacity:.45; }
 .gallery-group-header { grid-column:1/-1; display:flex; align-items:center; gap:8px; min-height:28px; margin:8px 0 0; padding:4px 2px; color:var(--text-bright); font-size:11px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; border-bottom:1px solid var(--border); }
 .gallery-group-dot { width:9px; height:9px; border-radius:50%; background:var(--model-color,#64748b); box-shadow:0 0 12px var(--model-color,#64748b); flex-shrink:0; }
 .gallery-group-count { color:var(--text-dim); font-family:var(--mono); font-size:10px; font-weight:500; margin-left:2px; }
@@ -3030,13 +3239,13 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 })();
 
 var API = {
-    get: function(url) {
-        return fetch(url).then(function(r){
+    get: function(url, options) {
+        return fetch(url, options).then(function(r){
             return r.json().catch(function(){ return {}; }).then(function(body){
                 if (!r.ok) throw new Error(body.error || ('HTTP ' + r.status));
                 return body;
             });
-        }).catch(function(e){ showToast('Error: '+e.message); return null; });
+        }).catch(function(e){ if (e.name !== 'AbortError') showToast('Error: '+e.message); return null; });
     },
     post: function(url, data) {
         return fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)}).then(function(r){
@@ -3079,7 +3288,53 @@ var searchQuery = '';
 var searchFolderFilter = null;
 var multiSelected = new Set(); // Set of file paths
 var hasTrash = true; // Updated at init from server
-var metaCache = {}; // path -> metadata cache
+var metaCache = {}; // bounded, completed metadata only
+var metaRequestId = 0;
+var metaAbort = null;
+var metaRefreshTimer = null;
+var galleryRequestId = 0;
+var galleryRequestsInFlight = 0;
+var lastGalleryRevision = null;
+var statusRequestRunning = false;
+var pendingDeletePaths = new Set();
+var deleteStarting = false;
+
+function thumbnailUrl(path, mtime, processing) {
+    if (mtime === undefined) {
+        var file = currentFiles.find(function(f) { return f.path === path; }) || {};
+        mtime = file.mtime;
+        processing = file.processing;
+    }
+    return '/thumb/' + encodeURIComponent(path) + '?v=' + encodeURIComponent(String(mtime || 0) + ':' + (processing ? 'pending' : 'ready'));
+}
+
+function prepareThumbnail(img) {
+    img.addEventListener('load', function() {
+        img.dataset.thumbPending = img.naturalWidth === 1 && img.naturalHeight === 1 ? '1' : '';
+    });
+}
+
+function retryPendingThumbnails(changed) {
+    if (window.galleryProcessingPaused) return;
+    document.querySelectorAll('img[data-thumb-pending="1"]').forEach(function(img) {
+        var retries = changed ? 0 : Number(img.dataset.thumbRetries || 0);
+        if (retries >= 4) return;
+        img.dataset.thumbRetries = String(retries + 1);
+        img.dataset.thumbPending = '';
+        img.src = img.src.replace(/&retry=[^&]*/, '') + '&retry=' + Date.now();
+    });
+}
+
+async function fetchGalleryData(url, requestId) {
+    galleryRequestsInFlight++;
+    try {
+        var data = await API.get(url);
+        return requestId === galleryRequestId ? data : null;
+    } finally {
+        galleryRequestsInFlight--;
+    }
+}
+
 var lastGalleryTotal = 0;
 var specialView = null; // null, 'favorites', timeline, collection, or 'ai-tags'
 var metaPanelPinned = localStorage.getItem('galleryMetaPinned') === '1';
@@ -3214,6 +3469,52 @@ async function loadChildrenFor(wrapper, parentPath) {
     }
 }
 
+async function refreshVisibleFolders() {
+    if (searchMode) return;
+    var containers = Array.from(document.querySelectorAll('#folderTree .folder-children.open'));
+    // Bound concurrent sidebar queries; unopened branches remain lazy-loaded.
+    for (var offset = 0; offset < containers.length; offset += 4) {
+        await Promise.all(containers.slice(offset, offset + 4).map(async function(container) {
+            var parentItem = container.parentElement.querySelector(':scope > .folder-item');
+            var parent = parentItem ? parentItem.dataset.path || '' : '';
+            var folders = await API.get('/api/folders?parent=' + encodeURIComponent(parent) + '&active=' + encodeURIComponent(currentFolder || ''));
+            if (!folders || !container.isConnected || searchMode) return;
+            var existing = new Map();
+            Array.from(container.children).forEach(function(wrapper) {
+                var item = wrapper.querySelector(':scope > .folder-item');
+                if (item) existing.set(item.dataset.path, wrapper);
+            });
+            var desired = folders.map(function(folder) {
+                var wrapper = existing.get(folder.path);
+                if (!wrapper) return createFolderItem(folder, getDepth(folder.path));
+                var coverChanged = wrapper._folderInfo.cover !== folder.cover || wrapper._folderInfo.latest !== folder.latest;
+                Object.assign(wrapper._folderInfo, folder);
+                var item = wrapper.querySelector(':scope > .folder-item');
+                if (coverChanged) {
+                    var icon = item.querySelector('.folder-icon');
+                    icon.innerHTML = folder.cover ? '<img src="' + escAttr(thumbnailUrl(folder.cover, folder.latest)) + '" loading="lazy">' : ICON_FOLDER;
+                    var image = icon.querySelector('img');
+                    if (image) prepareThumbnail(image);
+                }
+                var count = item.querySelector('.folder-count');
+                if (!count) { count = document.createElement('span'); count.className = 'folder-count'; item.appendChild(count); }
+                count.textContent = folder.count || '';
+                item.classList.toggle('active', folder.path === currentFolder);
+                item.querySelector('.folder-toggle').classList.toggle('empty', !folder.has_children);
+                if (folder.has_children && !wrapper.querySelector(':scope > .folder-children')) {
+                    var child = document.createElement('div'); child.className = 'folder-children'; wrapper.appendChild(child);
+                }
+                return wrapper;
+            });
+            var keep = new Set(desired);
+            Array.from(container.children).forEach(function(child) { if (!keep.has(child)) child.remove(); });
+            desired.forEach(function(child, index) {
+                if (container.children[index] !== child) container.insertBefore(child, container.children[index] || null);
+            });
+        }));
+    }
+}
+
 function getDepth(path) { return path ? path.split(/[\\/]/).length : 0; }
 
 function closeSiblingFolders(wrapper, folderPath) {
@@ -3249,18 +3550,21 @@ function shouldRestoreFolderOpen(path) {
 function createFolderItem(folder, depth) {
     var wrapper = document.createElement('div');
     wrapper.className = 'folder-wrapper';
+    wrapper._folderInfo = folder;
     var el = document.createElement('div');
     el.className = 'folder-item';
     el.style.paddingLeft = (8 + depth * 18) + 'px';
     el.dataset.path = folder.path;
     var toggleClass = folder.has_children ? 'folder-toggle' : 'folder-toggle empty';
     var iconHtml = folder.cover
-        ? '<div class="folder-icon"><img src="/thumb/' + encodeURIComponent(folder.cover) + '" loading="lazy"></div>'
+        ? '<div class="folder-icon"><img src="' + escAttr(thumbnailUrl(folder.cover, folder.latest)) + '" loading="lazy"></div>'
         : '<div class="folder-icon">' + ICON_FOLDER + '</div>';
     el.innerHTML = '<span class="' + toggleClass + '">&#x25B6;</span>' + iconHtml +
         '<span class="folder-name">' + escHtml(folder.name) + '</span>' +
         (folder.count > 0 ? '<span class="folder-count">' + folder.count + '</span>' : '');
     wrapper.appendChild(el);
+    var coverImg = el.querySelector('.folder-icon img');
+    if (coverImg) prepareThumbnail(coverImg);
     if (folder.has_children) {
         var childDiv = document.createElement('div');
         childDiv.className = 'folder-children';
@@ -3389,10 +3693,11 @@ function exitSearchMode() {
     scheduleGalleryStateSave();
 }
 
-async function doSearch() {
+async function doSearch(quiet) {
+    var request = ++galleryRequestId;
     var loading = document.getElementById('loadingBar');
-    loading.classList.add('active');
-    showGalleryPlaceholder('Searching...', 'Large metadata searches can take a moment while the gallery index is being updated.');
+    if (!quiet) loading.classList.add('active');
+    if (!quiet) showGalleryPlaceholder('Searching...', 'Large metadata searches can take a moment while the gallery index is being updated.');
 
     var sort = document.getElementById('sortSelect').value;
     var parts = sort.split('-');
@@ -3407,22 +3712,24 @@ async function doSearch() {
         url = '/api/search?q=' + encodeURIComponent(searchQuery) + '&page=' + currentPage + sortParam + modelInfoParam() + metadataFilterParam();
     }
 
-    var data = await API.get(url);
+    var data = await fetchGalleryData(url, request);
+    if (request !== galleryRequestId) return;
     loading.classList.remove('active');
     if (!data) return;
 
     // Update folder sidebar (only on global search, not folder-filtered)
-    if (searchFolderFilter === null && data.folders) {
+    if (!quiet && searchFolderFilter === null && data.folders) {
         renderSearchFolders(data.folders, null);
     } else if (searchFolderFilter !== null && !data.folders) {
         // Keep current sidebar but update active state
     }
 
+    if (data.revision !== undefined) lastGalleryRevision = data.revision;
     currentFiles = data.files || [];
     totalPages = data.pages || 1;
     currentPage = data.page || 1;
 
-    renderGalleryFiles(currentFiles, data.total || 0, true);
+    renderGalleryFiles(currentFiles, data.total || 0, true, quiet);
     renderPagination();
     updateBreadcrumb(searchFolderFilter !== null ? searchFolderFilter : '');
     scheduleGalleryStateSave();
@@ -3448,21 +3755,24 @@ function updateAiFilterButton() {
     btn.title = aiTagFilter.length ? ('AI tags: ' + aiTagFilter.join(', ')) : 'Filter or tag images using visual AI tags';
 }
 
-async function loadAiTagView(resetPage) {
+async function loadAiTagView(resetPage, quiet) {
+    var request = ++galleryRequestId;
     if (!autoTaggerAvailable || !aiTagFilter.length) return;
     if (resetPage === undefined) resetPage = true;
-    activateSpecialView('ai-tags', null, resetPage);
+    if (!quiet) activateSpecialView('ai-tags', null, resetPage);
     updateAiFilterButton();
     var sort = document.getElementById('sortSelect').value.split('-');
     var url = '/api/auto_tagger/files?tags=' + encodeURIComponent(aiTagFilter.join(',')) +
         '&folder=' + encodeURIComponent(aiTagFolder || '') +
         '&sort=' + sort[0] + '&order=' + sort[1] + '&page=' + currentPage + modelInfoParam() + metadataFilterParam();
-    var data = await API.get(url);
+    var data = await fetchGalleryData(url, request);
+    if (request !== galleryRequestId) return;
     if (!data) return;
+    if (data.revision !== undefined) lastGalleryRevision = data.revision;
     currentFiles = data.files || [];
     totalPages = data.pages || 1;
     currentPage = data.page || 1;
-    renderGalleryFiles(currentFiles, data.total || 0, true);
+    renderGalleryFiles(currentFiles, data.total || 0, true, quiet);
     renderPagination();
     updateToolbarNav();
     updateBreadcrumb(aiTagFolder || '');
@@ -3595,29 +3905,33 @@ function updateBreadcrumb(folder) {
     });
 }
 
-async function loadGallery(folder) {
+async function loadGallery(folder, quiet) {
+    var request = ++galleryRequestId;
     var sort = document.getElementById('sortSelect').value;
     var parts = sort.split('-');
     var loading = document.getElementById('loadingBar');
-    loading.classList.add('active');
-    showGalleryPlaceholder('Loading gallery...', 'If the index is running, new images will appear here as they are processed.');
+    if (!quiet) loading.classList.add('active');
+    if (!quiet) showGalleryPlaceholder('Loading gallery...', 'If the index is running, new images will appear here as they are processed.');
 
-    var data = await API.get('/api/files?folder=' + encodeURIComponent(folder) +
-        '&sort=' + parts[0] + '&order=' + parts[1] + '&page=' + currentPage + modelInfoParam() + metadataFilterParam());
+    var data = await fetchGalleryData('/api/files?folder=' + encodeURIComponent(folder) +
+        '&sort=' + parts[0] + '&order=' + parts[1] + '&page=' + currentPage + modelInfoParam() + metadataFilterParam(), request);
+    if (request !== galleryRequestId) return;
     loading.classList.remove('active');
     if (!data) return;
 
+    if (data.revision !== undefined) lastGalleryRevision = data.revision;
     currentFiles = data.files || [];
     totalPages = data.pages || 1;
     currentPage = data.page || 1;
 
-    renderGalleryFiles(currentFiles, data.total || 0, false);
+    renderGalleryFiles(currentFiles, data.total || 0, false, quiet);
     renderPagination();
     scheduleGalleryStateSave();
 }
 
 function showGalleryPlaceholder(title, detail) {
     var grid = document.getElementById('galleryGrid');
+    if (grid && grid.querySelector('.thumb-card')) return;
     var empty = document.getElementById('galleryEmpty');
     var titleEl = document.getElementById('galleryEmptyTitle');
     var detailEl = document.getElementById('galleryEmptyDetail');
@@ -3722,6 +4036,8 @@ function createThumbCard(file, index) {
     card.className = 'thumb-card';
     card.dataset.path = file.path;
     card.dataset.index = index;
+    card.dataset.renderKey = JSON.stringify(file) + ':' + galleryGroupMode;
+    card.classList.toggle('delete-pending', pendingDeletePaths.has(file.path));
     var hasDimensions = Number(file.width) > 0 && Number(file.height) > 0;
     card.dataset.aspectRatio = hasDimensions ? file.width / file.height : 1;
     var dimsText = (file.width && file.height) ? file.width + '\u00D7' + file.height : '';
@@ -3731,18 +4047,19 @@ function createThumbCard(file, index) {
     var showModelBadge = galleryGroupMode === 'none' && groupInfo.key !== 'unknown';
     card.style.setProperty('--model-color', groupInfo.color);
     card.innerHTML =
-        '<img data-src="/thumb/' + encodeURIComponent(file.path) + '" alt="' + escAttr(file.name) + '" loading="lazy">' +
+        '<img data-src="' + escAttr(thumbnailUrl(file.path, file.mtime, file.processing)) + '" alt="' + escAttr(file.name) + '" loading="lazy">' +
         '<span class="' + favClass + '" data-path="' + escAttr(file.path) + '">' + favStar + '</span>' +
         (file.has_metadata ? '<div class="thumb-meta-badge" title="Metadata found"></div>' : '') +
         (file.processing ? '<div class="thumb-processing" title="Metadata and thumbnail are being processed">Processing</div>' : '') +
         (dimsText ? '<div class="thumb-dims">' + dimsText + '</div>' : '') +
         (showModelBadge ? '<div class="thumb-model-badge">' + escHtml(groupInfo.label) + '</div>' : '') +
         '<div class="thumb-overlay"><div class="thumb-name">' + escHtml(file.name) + '</div></div>';
+    prepareThumbnail(card.querySelector('img'));
     // Newly indexed files start square until their lazy-loaded thumbnail supplies
     // its intrinsic dimensions. No original image request or extra cache is needed.
     if (!hasDimensions) {
         card.querySelector('img').addEventListener('load', function() {
-            if (this.naturalWidth && this.naturalHeight) {
+            if (this.naturalWidth > 1 && this.naturalHeight > 1) {
                 card.dataset.aspectRatio = this.naturalWidth / this.naturalHeight;
                 if (card.isConnected) scheduleGalleryLayout();
             }
@@ -3771,23 +4088,43 @@ function createThumbCard(file, index) {
             selectImage(fp, c);
         }
     }})(file.path, card, index));
-    card.addEventListener('dblclick', (function(idx,fp){return function(){lightboxIndex=idx; openLightbox('/image/'+encodeURIComponent(fp))}})(index, file.path));
+    card.addEventListener('dblclick', (function(idx,fp){return function(){lightboxIndex=currentFiles.findIndex(function(f){return f.path===fp}); openLightbox('/image/'+encodeURIComponent(fp))}})(index, file.path));
     if (selectedFile === file.path) card.classList.add('selected');
     // Restore multi-select state if re-rendering same page
     if (multiSelected.has(file.path)) { card.classList.add('multi-selected'); }
     return card;
 }
 
-function renderGalleryFiles(files, total, isSearch) {
+function renderGalleryFiles(files, total, isSearch, quiet) {
     var grid = document.getElementById('galleryGrid');
     var empty = document.getElementById('galleryEmpty');
     var toolbar = document.getElementById('galleryToolbar');
     var countEl = document.getElementById('galleryCount');
     lastGalleryTotal = total || files.length || 0;
     if (galleryThumbObserver) galleryThumbObserver.disconnect();
-    grid.innerHTML = '';
+    var area = document.getElementById('galleryArea');
+    var oldCards = new Map();
+    var anchor = null;
+    var areaTop = area.getBoundingClientRect().top;
+    grid.querySelectorAll('.thumb-card').forEach(function(card) {
+        oldCards.set(card.dataset.path, card);
+        if (quiet && !anchor && card.getBoundingClientRect().bottom > areaTop) anchor = {path:card.dataset.path, top:card.getBoundingClientRect().top};
+    });
+    var desired = [];
+    function cardFor(file, index) {
+        var old = oldCards.get(file.path);
+        var card = old && old.dataset.renderKey === JSON.stringify(file) + ':' + galleryGroupMode ? old : createThumbCard(file, index);
+        card.dataset.index = index;
+        card.classList.toggle('selected', selectedFile === file.path);
+        card.classList.toggle('multi-selected', multiSelected.has(file.path));
+        card.classList.toggle('delete-pending', pendingDeletePaths.has(file.path));
+        desired.push(card);
+        if (card.querySelector('img[data-src]')) observer.observe(card);
+        return card;
+    }
 
     if (files.length === 0) {
+        grid.replaceChildren();
         var metadataFiltered = metadataFilter !== 'all';
         showGalleryPlaceholder(
             isSearch ? 'No results found' : (metadataFiltered ? 'No images match this metadata filter' : 'No images in this folder'),
@@ -3825,9 +4162,7 @@ function renderGalleryFiles(files, total, isSearch) {
 
     if (galleryGroupMode === 'none') {
         for (var i = 0; i < files.length; i++) {
-            var card = createThumbCard(files[i], i);
-            grid.appendChild(card);
-            observer.observe(card);
+            cardFor(files[i], i);
         }
     } else {
         var groups = [];
@@ -3841,66 +4176,29 @@ function renderGalleryFiles(files, total, isSearch) {
             groupMap[info.key].items.push({ file: files[gi], index: gi });
         }
         groups.forEach(function(group) {
-            grid.appendChild(createGalleryGroupHeader(group.info, group.items.length));
+            desired.push(createGalleryGroupHeader(group.info, group.items.length));
             group.items.forEach(function(item) {
-                var card = createThumbCard(item.file, item.index);
-                grid.appendChild(card);
-                observer.observe(card);
+                cardFor(item.file, item.index);
             });
         });
     }
+    var keep = new Set(desired);
+    Array.from(grid.children).forEach(function(node) { if (!keep.has(node)) node.remove(); });
+    desired.forEach(function(node, index) {
+        if (grid.children[index] !== node) grid.insertBefore(node, grid.children[index] || null);
+    });
     layoutGallery();
-    // Prefetch next page thumbnails
+    if (anchor) {
+        var anchorCard = findThumbCard(anchor.path);
+        if (anchorCard) area.scrollTop += anchorCard.getBoundingClientRect().top - anchor.top;
+    }
+    // Keep visible work ahead of background prefetch.
     restoreGalleryScrollIfNeeded();
     scheduleGalleryStateSave();
-    if (currentPage < totalPages) {
-        prefetchNextPage();
-    }
+
 }
 
-function prefetchNextPage() {
-    // Fetch next page file list silently, then preload their thumb URLs
-    var nextPage = currentPage + 1;
-    var url;
-    if (searchMode) {
-        var sort = document.getElementById('sortSelect').value;
-        var parts = sort.split('-');
-        var sortParam = '&sort=' + parts[0] + '&order=' + parts[1];
-        if (searchFolderFilter !== null) {
-            url = '/api/search_folder?q=' + encodeURIComponent(searchQuery) +
-                  '&folder=' + encodeURIComponent(searchFolderFilter) +
-                  '&page=' + nextPage + sortParam + modelInfoParam() + metadataFilterParam();
-        } else {
-            url = '/api/search?q=' + encodeURIComponent(searchQuery) + '&page=' + nextPage + sortParam + modelInfoParam() + metadataFilterParam();
-        }
-    } else if (specialView === 'ai-tags' && aiTagFilter.length) {
-        var sort = document.getElementById('sortSelect').value;
-        var parts = sort.split('-');
-        url = '/api/auto_tagger/files?tags=' + encodeURIComponent(aiTagFilter.join(',')) +
-              '&folder=' + encodeURIComponent(aiTagFolder || '') +
-              '&sort=' + parts[0] + '&order=' + parts[1] + '&page=' + nextPage + modelInfoParam() + metadataFilterParam();
-    } else {
-        var sort = document.getElementById('sortSelect').value;
-        var parts = sort.split('-');
-        url = '/api/files?folder=' + encodeURIComponent(currentFolder) +
-              '&sort=' + parts[0] + '&order=' + parts[1] + '&page=' + nextPage + modelInfoParam() + metadataFilterParam();
-    }
-    // Keep navigation warm without competing with visible thumbnails or indexing.
-    var runPrefetch = function() {
-        fetch(url).then(function(r) { return r.json(); }).then(function(data) {
-            if (!data || !data.files) return;
-            data.files.slice(0, 12).forEach(function(f) {
-                var link = document.createElement('link');
-                link.rel = 'prefetch';
-                link.href = '/thumb/' + encodeURIComponent(f.path);
-                link.as = 'image';
-                document.head.appendChild(link);
-            });
-        }).catch(function() {});
-    };
-    if (window.requestIdleCallback) requestIdleCallback(runPrefetch, {timeout: 1200});
-    else setTimeout(runPrefetch, 350);
-}
+
 
 // ═══════════════════════════════════════════════════════
 // ── Pagination
@@ -4020,33 +4318,46 @@ function goToPage(page) {
 // ── Image Selection & Metadata
 // ═══════════════════════════════════════════════════════
 
-async function selectImage(path, cardEl, keepSelectionAnchor) {
+async function selectImage(path, cardEl, keepSelectionAnchor, refreshOnly) {
+    var request = ++metaRequestId;
+    if (metaAbort) metaAbort.abort();
+    clearTimeout(metaRefreshTimer);
     selectedFile = path;
     if (!keepSelectionAnchor) selectionAnchorFile = path || null;
     try { localStorage.setItem('gallerySelectedImage', path || ''); } catch (e) {}
     scheduleGalleryStateSave();
-    setMetaPanelCollapsed(false);
-    document.querySelectorAll('.thumb-card').forEach(function(c){c.classList.remove('selected')});
+    if (!refreshOnly) setMetaPanelCollapsed(false);
+    document.querySelectorAll('.thumb-card.selected').forEach(function(c){c.classList.remove('selected')});
     if (cardEl) cardEl.classList.add('selected');
     var panel = document.getElementById('metaPanel');
-    // Check cache first
     var meta = metaCache[path];
     if (!meta) {
-        meta = await API.get('/api/metadata?path=' + encodeURIComponent(path));
-        if (meta && (meta.info || meta.parsed)) { metaCache[path] = meta; }
+        window._libMeta = null; window._libPath = path;
+        panel.innerHTML = '<div class="meta-panel-head"><div class="meta-panel-title">' + escHtml(path.split('/').pop()) +
+            '</div></div><div class="meta-preview"><img src="' + escAttr(thumbnailUrl(path)) + '" alt=""></div><div class="meta-empty">Loading metadata...</div>';
+        prepareThumbnail(panel.querySelector('img'));
+        // Highlight and preview immediately; coalesce fast clicks/arrow keys.
+        await new Promise(function(resolve) { setTimeout(resolve, 80); });
+        if (request !== metaRequestId || selectedFile !== path) return;
+        metaAbort = new AbortController();
+        meta = await API.get('/api/metadata?path=' + encodeURIComponent(path), {signal:metaAbort.signal});
+        if (request !== metaRequestId || selectedFile !== path) return;
+        if (meta && meta.info && !meta.processing) {
+            if (Object.keys(metaCache).length >= 128) delete metaCache[Object.keys(metaCache)[0]];
+            metaCache[path] = meta;
+        }
     }
-    if (meta && meta.processing && (!meta.parsed || Object.keys(meta.parsed).length === 0)) {
-        panel.innerHTML = '<div class="meta-empty">Processing metadata...</div>';
-        setTimeout(function() {
-            if (selectedFile === path) {
-                delete metaCache[path];
-                selectImage(path, cardEl, true);
-            }
-        }, 1500);
+    if (request !== metaRequestId || selectedFile !== path) return;
+    if (!meta || (!meta.info && !meta.parsed)) {
+        panel.innerHTML = '<div class="meta-empty">Metadata unavailable</div>';
         return;
     }
-    if (!meta || (!meta.info && !meta.parsed)) { panel.innerHTML = '<div class="meta-empty">No metadata found</div>'; return; }
     renderMetaPanel(meta, path);
+    if (meta.processing) {
+        metaRefreshTimer = setTimeout(function() {
+            if (request === metaRequestId && selectedFile === path) selectImage(path, findThumbCard(path), true, true);
+        }, 1500);
+    }
 }
 
 function renderMetaPanel(meta, path) {
@@ -4070,7 +4381,7 @@ function renderMetaPanel(meta, path) {
                 '<button class="meta-mini-btn" id="metaCollapseBtn" title="Hide metadata panel">&#x203A;</button>' +
             '</div>' +
         '</div>' +
-        '<div class="meta-preview" id="metaPreview"><img src="/image/' + encodeURIComponent(path) + '" alt=""></div>' +
+        '<div class="meta-preview" id="metaPreview"><img src="' + escAttr(thumbnailUrl(path, info.mtime, meta.processing)) + '" alt=""></div>' +
         '<div class="meta-tabs">' +
         '<button class="meta-tab ' + (currentMetaTab==='metadata'?'active':'') + '" data-tab="metadata">Metadata</button>' +
         '<button class="meta-tab ' + (currentMetaTab==='raw'?'active':'') + '" data-tab="raw">Raw Metadata</button>' +
@@ -4083,6 +4394,8 @@ function renderMetaPanel(meta, path) {
     else html += '<div class="meta-empty">Loading AI tags...</div>';
     html += '</div>';
     panel.innerHTML = html;
+    prepareThumbnail(panel.querySelector('.meta-preview img'));
+    document.getElementById('metaDeleteBtn').disabled = deleteStarting || deleteObservedActive;
     document.getElementById('metaPinBtn').addEventListener('click', function() {
         setMetaPanelPinned(!metaPanelPinned);
         renderMetaPanel(meta, path);
@@ -4791,42 +5104,52 @@ function renderDeleteProgress(job) {
     document.getElementById('deleteProgressMessage').textContent = job.error || job.message || 'Preparing deletion';
 }
 
-async function loadCurrentGalleryView() {
-    if (searchMode) return doSearch();
-    if (specialView === 'ai-tags') return loadAiTagView(false);
-    if (specialView === 'favorites') return loadFavorites(document.querySelector('#navFavorites'), false);
+async function loadCurrentGalleryView(quiet) {
+    if (searchMode) return doSearch(quiet);
+    if (specialView === 'ai-tags') return loadAiTagView(false, quiet);
+    if (specialView === 'favorites') return loadFavorites(document.querySelector('#navFavorites'), false, quiet);
     if (specialView === 'today' || specialView === '7days' || specialView === '30days') {
-        return loadTimeline(specialView, document.querySelector('.sidebar-special.active'), false);
+        return loadTimeline(specialView, document.querySelector('.sidebar-special.active'), false, quiet);
     }
     if (specialView && specialView.startsWith('collection:')) {
-        var colId = parseInt(specialView.split(':')[1]);
-        var col = collectionsCache.find(function(item) { return item.id === colId; });
-        if (col) return viewCollection(col, false);
+        var id = parseInt(specialView.split(':')[1]);
+        var col = collectionsCache.find(function(item) { return item.id === id; });
+        if (col) return viewCollection(col, false, quiet);
     }
-    return loadGallery(currentFolder);
+    return loadGallery(currentFolder, quiet);
 }
 
-async function refreshGalleryAfterDelete() {
-    closeLightbox();
-    selectedFile = null;
-    selectionAnchorFile = null;
-    clearMultiSelect();
-    document.getElementById('metaPanel').innerHTML = '<div class="meta-empty">Click an image to view its generation metadata</div>';
-    await loadCurrentGalleryView();
+async function refreshGalleryAfterDelete(job) {
+    var details = job.details || {};
+    var deleted = new Set(details.deleted_paths || []);
+    var replaceSelection = selectedFile && deleted.has(selectedFile);
+    pendingDeletePaths.clear();
+    deleted.forEach(function(path) { multiSelected.delete(path); delete metaCache[path]; });
+    if (replaceSelection) {
+        closeLightbox();
+        selectedFile = null;
+        selectionAnchorFile = null;
+        metaRequestId++;
+        if (metaAbort) metaAbort.abort();
+        clearTimeout(metaRefreshTimer);
+        document.getElementById('metaPanel').innerHTML = '<div class="meta-empty">Select an image to view metadata</div>';
+    }
+    updateSelectionBar();
+    await loadCurrentGalleryView(true);
     if (currentPage > totalPages) {
         currentPage = Math.max(1, totalPages);
-        await loadCurrentGalleryView();
+        await loadCurrentGalleryView(true);
     }
-    var target = deletePreferredPath && currentFiles.find(function(file){ return file.path === deletePreferredPath; });
-    if (!target && currentFiles.length) target = currentFiles[0];
-    if (target) {
-        var card = findThumbCard(target.path);
-        selectImage(target.path, card);
-        if (card) card.scrollIntoView({block:'nearest'});
+    if (replaceSelection && !selectedFile) {
+        var target = currentFiles.find(function(file) { return file.path === deletePreferredPath; }) || currentFiles[0];
+        if (target) selectImage(target.path, findThumbCard(target.path));
     }
     deletePreferredPath = null;
     setDeleteControls(false);
-    await Promise.all([loadFolderTree(), loadCollections(), updateStatus()]);
+    // Update side data without clearing the visible page.
+    loadCollections();
+    refreshVisibleFolders();
+    updateStatus();
 }
 
 function pollDeleteProgress(delay) {
@@ -4852,10 +5175,11 @@ function pollDeleteProgress(delay) {
             }
             if (deleteObservedActive) {
                 deleteObservedActive = false;
-                await refreshGalleryAfterDelete();
+                await refreshGalleryAfterDelete(job);
                 var details = job.details || {};
                 var summary = details.deleted != null ? details.deleted + ' moved to trash' : (job.message || 'Delete complete');
                 if (details.failed) summary += ', ' + details.failed + ' failed';
+                if (details.failures && details.failures.length) summary += ': ' + details.failures[0].error;
                 showToast(summary);
             }
             setTimeout(function() {
@@ -4869,15 +5193,21 @@ function pollDeleteProgress(delay) {
 }
 
 async function executeDelete(paths) {
-    if (deleteObservedActive) {
+    if (deleteStarting || deleteObservedActive) {
         showToast('A delete job is already running');
         return;
     }
+    deleteStarting = true;
+    pendingDeletePaths = new Set(paths);
+    paths.forEach(function(path) { var card = findThumbCard(path); if (card) card.classList.add('delete-pending'); });
     deletePreferredPath = chooseDeleteFallback(paths);
     setDeleteControls(true);
     renderDeleteProgress({active:true, current:0, total:paths.length, message:'Starting background delete'});
     var result = await API.post('/api/delete/start', { scope:'paths', paths:paths });
+    deleteStarting = false;
     if (!result || !result.started) {
+        pendingDeletePaths.clear();
+        document.querySelectorAll('.delete-pending').forEach(function(card) { card.classList.remove('delete-pending'); });
         setDeleteControls(false);
         document.getElementById('deleteProgress').classList.remove('visible');
         if (result && result.busy) showToast('Another Gallery maintenance task is already running');
@@ -4984,40 +5314,46 @@ document.getElementById('navToday').addEventListener('click', function() { loadT
 document.getElementById('navWeek').addEventListener('click', function() { loadTimeline('7days', this); });
 document.getElementById('navMonth').addEventListener('click', function() { loadTimeline('30days', this); });
 
-async function loadFavorites(el, resetPage) {
+async function loadFavorites(el, resetPage, quiet) {
+    var request = ++galleryRequestId;
     if (resetPage === undefined) resetPage = true;
-    activateSpecialView('favorites', el, resetPage);
+    if (!quiet) activateSpecialView('favorites', el, resetPage);
     updateBreadcrumb('');
     var sort = document.getElementById('sortSelect').value;
     var parts = sort.split('-');
     var sortField = parts[0] === 'favorite' ? 'date' : parts[0];
     var sortOrder = parts[0] === 'favorite' ? 'desc' : parts[1];
-    var data = await API.get('/api/favorites?sort=' + sortField + '&order=' + sortOrder + '&page=' + currentPage + modelInfoParam() + metadataFilterParam());
+    var data = await fetchGalleryData('/api/favorites?sort=' + sortField + '&order=' + sortOrder + '&page=' + currentPage + modelInfoParam() + metadataFilterParam(), request);
+    if (request !== galleryRequestId) return;
     if (!data) return;
+    if (data.revision !== undefined) lastGalleryRevision = data.revision;
     currentFiles = data.files || [];
     totalPages = data.pages || 1;
     currentPage = data.page || 1;
     document.getElementById('galleryCount').textContent = (data.total || 0) + ' favorites';
-    renderGalleryFiles(currentFiles, data.total || 0, false);
+    renderGalleryFiles(currentFiles, data.total || 0, false, quiet);
     renderPagination();
     updateToolbarNav();
     scheduleGalleryStateSave();
 }
 
-async function loadTimeline(period, el, resetPage) {
+async function loadTimeline(period, el, resetPage, quiet) {
+    var request = ++galleryRequestId;
     if (resetPage === undefined) resetPage = true;
-    activateSpecialView(period, el, resetPage);
+    if (!quiet) activateSpecialView(period, el, resetPage);
     var labels = { today: 'Today', '7days': 'Last 7 days', '30days': 'Last 30 days' };
     updateBreadcrumb('');
     var sort = document.getElementById('sortSelect').value;
     var parts = sort.split('-');
-    var data = await API.get('/api/timeline?period=' + period + '&sort=' + parts[0] + '&order=' + parts[1] + '&page=' + currentPage + modelInfoParam() + metadataFilterParam());
+    var data = await fetchGalleryData('/api/timeline?period=' + period + '&sort=' + parts[0] + '&order=' + parts[1] + '&page=' + currentPage + modelInfoParam() + metadataFilterParam(), request);
+    if (request !== galleryRequestId) return;
     if (!data) return;
+    if (data.revision !== undefined) lastGalleryRevision = data.revision;
     currentFiles = data.files || [];
     totalPages = data.pages || 1;
     currentPage = data.page || 1;
     document.getElementById('galleryCount').textContent = (data.total || 0) + ' images \u2014 ' + labels[period];
-    renderGalleryFiles(currentFiles, data.total || 0, false);
+    renderGalleryFiles(currentFiles, data.total || 0, false, quiet);
     renderPagination();
     updateToolbarNav();
     scheduleGalleryStateSave();
@@ -5069,21 +5405,24 @@ function renderCollectionsSidebar(collections) {
     }
 }
 
-async function viewCollection(col, resetPage) {
+async function viewCollection(col, resetPage, quiet) {
+    var request = ++galleryRequestId;
     if (resetPage === undefined) resetPage = true;
-    activateSpecialView('collection:' + col.id, null, resetPage);
+    if (!quiet) activateSpecialView('collection:' + col.id, null, resetPage);
     document.querySelectorAll('.coll-item').forEach(function(e) { e.classList.remove('active'); });
     var el = document.querySelector('.coll-item[data-id="' + col.id + '"]');
     if (el) el.classList.add('active');
     var sort = document.getElementById('sortSelect').value;
     var parts = sort.split('-');
-    var data = await API.get('/api/collection/files?id=' + col.id + '&sort=' + parts[0] + '&order=' + parts[1] + '&page=' + currentPage + modelInfoParam() + metadataFilterParam());
+    var data = await fetchGalleryData('/api/collection/files?id=' + col.id + '&sort=' + parts[0] + '&order=' + parts[1] + '&page=' + currentPage + modelInfoParam() + metadataFilterParam(), request);
+    if (request !== galleryRequestId) return;
     if (!data) return;
+    if (data.revision !== undefined) lastGalleryRevision = data.revision;
     currentFiles = data.files || [];
     totalPages = data.pages || 1;
     currentPage = data.page || 1;
     document.getElementById('galleryCount').textContent = (data.total || 0) + ' in "' + col.name + '"';
-    renderGalleryFiles(currentFiles, data.total || 0, false);
+    renderGalleryFiles(currentFiles, data.total || 0, false, quiet);
     renderPagination();
     updateToolbarNav();
     scheduleGalleryStateSave();
@@ -5176,6 +5515,9 @@ function copyFallback(text) {
 }
 function showToast(msg) { var e=document.querySelector('.toast'); if(e)e.remove(); var t=document.createElement('div'); t.className='toast'; t.textContent=msg; document.body.appendChild(t); setTimeout(function(){t.remove()},2500); }
 async function updateStatus() {
+    if (statusRequestRunning || document.hidden) return;
+    statusRequestRunning = true;
+    try {
     var s = await API.get('/api/stats');
     if (!s) return;
     document.getElementById('statusFiles').textContent = s.files + ' images';
@@ -5235,6 +5577,21 @@ async function updateStatus() {
         window.galleryProcessingBatchTotal = 0;
         window.galleryProcessingLastPending = undefined;
     }
+    var changed = lastGalleryRevision !== null && s.revision !== lastGalleryRevision;
+    if (lastGalleryRevision === null) lastGalleryRevision = s.revision;
+    retryPendingThumbnails(changed);
+    if (changed && !galleryRequestsInFlight && !deleteObservedActive && !deleteStarting) {
+        lastGalleryRevision = s.revision;
+        var oldSelected = currentFiles.find(function(f) { return f.path === selectedFile; });
+        await loadCurrentGalleryView(true);
+        await refreshVisibleFolders();
+        var newSelected = currentFiles.find(function(f) { return f.path === selectedFile; });
+        if (oldSelected && newSelected && (oldSelected.mtime !== newSelected.mtime || oldSelected.processing !== newSelected.processing)) {
+            delete metaCache[selectedFile];
+            selectImage(selectedFile, findThumbCard(selectedFile), true, true);
+        }
+    }
+    } finally { statusRequestRunning = false; }
 }
 
 async function toggleBackgroundProcessing() {
@@ -5281,8 +5638,9 @@ function highlightFolderRetry(path) {
     }
     var restoringFolderView = !(savedState.searchMode && savedState.searchQuery) && !(savedState.specialView || '');
     if (restoringFolderView) currentFolder = savedFolder || '';
-    await loadFolderTree();
-    await loadCollections();
+    var sidebarReady = loadFolderTree();
+    var collectionsReady = loadCollections();
+    if (savedState.specialView && savedState.specialView.startsWith('collection:')) await collectionsReady;
     if (savedState.sort && document.getElementById('sortSelect')) {
         document.getElementById('sortSelect').value = savedState.sort;
     }
@@ -5341,7 +5699,7 @@ function highlightFolderRetry(path) {
     } catch (e) {}
     await updateStatus();
     pollDeleteProgress(0);
-    setInterval(updateStatus, 5000);
+    setInterval(updateStatus, 2000);
 })();
 
 function openCompare() {
@@ -5423,7 +5781,8 @@ class GalleryModule(Module):
     """Module wrapper around GalleryDB + the HTML gallery UI."""
 
     name = "Gallery"
-    version = "1.2.14"
+    version = "1.2.15"
+    release_stage = "stable"
     icon = "\U0001F5BC"   # 🖼
     description = "Browse and manage your AI-generated image collection."
     order = 10
@@ -5676,9 +6035,9 @@ class GalleryModule(Module):
         def run():
             try:
                 print(f"[GALLERY] {label} started in background...")
-                result = self.db.index_tree(force=force)
                 if self.setting("background_processing", True):
                     self.db.start_processing(self.setting("processing_workers", 2))
+                result = self.db.index_tree(force=force)
                 stats = self.db.get_stats()
                 print(f"[GALLERY] {stats['files']} images, {stats['folders']} folders, "
                       f"{stats['with_metadata']} with metadata")
@@ -5843,13 +6202,28 @@ class GalleryModule(Module):
     # ─── Image / thumb prefix routes ─────────────────────────────────────────
     def _handle_thumb(self, handler, rel_path):
         if not self._require_db(handler): return
-        self.db.prioritize_processing(rel_path)
-        abs_path = self.db.resolve_path(rel_path)
-        thumb = ensure_thumbnail(self.thumb_dir, rel_path, abs_path)
-        if thumb:
-            handler.serve_file(thumb, immutable=".thumbs" in thumb)
-        else:
-            handler.send_error(403)
+        state = self.db.thumbnail_state(rel_path)
+        if state is None:
+            handler.send_error(404)
+            return
+        thumb = get_thumb_path(self.thumb_dir, rel_path)
+        if thumbnail_is_current(thumb, state[0]):
+            # No source stat/decode on a cache hit. Watcher/discovery owns source
+            # versions, and the browser URL includes the indexed mtime.
+            handler.serve_file(thumb)
+            return
+        self.db.request_thumbnail(rel_path, state[0])
+        if self.setting("background_processing", True):
+            self.db.start_processing(self.setting("processing_workers", 2))
+        # A transient image must never become an immutable cached thumbnail.
+        # Intrinsic 1x1 identifies this placeholder for bounded browser retries.
+        data = b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1" viewBox="0 0 300 300"><rect width="300" height="300" fill="#20242d"/><path d="M110 160l30-30 30 35 20-20 30 35H80z" fill="#555e70"/><circle cx="175" cy="105" r="15" fill="#555e70"/></svg>'
+        handler.send_response(200)
+        handler.send_header("Content-Type", "image/svg+xml")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
 
     def _handle_image(self, handler, rel_path):
         if not self.db:
@@ -6163,7 +6537,9 @@ class GalleryModule(Module):
                     message += f"; {failed} failed"
                 self._maintenance_finish(
                     "delete", message,
-                    {"deleted": deleted, "failed": failed, "requested": total, "trash": True},
+                    {"deleted": deleted, "failed": failed, "requested": total, "trash": True,
+                     "deleted_paths": [r["path"] for r in results if r.get("ok")],
+                     "failures": [r for r in results if not r.get("ok")][:500]},
                 )
             except Exception as exc:
                 print(f"[GALLERY] Background delete failed: {exc}")

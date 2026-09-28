@@ -1,0 +1,12 @@
+{
+  "name": "full_watcher_batched_deletions_prototype",
+  "library_before": 259699,
+  "deleted": 100,
+  "seconds": 0.3954,
+  "result": {
+    "queued": 0,
+    "removed": 100,
+    "folders": 0
+  },
+  "note": "Actual watcher method with pruning collected then applied once before its folder refresh and commit; no OS trash work."
+}

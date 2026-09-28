@@ -1,0 +1,265 @@
+{
+  "source": "/Users/cyberdelia/Documents/GitHub-CyberHub/CyberHub-Gallery/modules/gallery/__init__.py",
+  "version": "1.2.14",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "sqlite": "3.53.4",
+  "synthetic": true,
+  "measurements": [
+    {
+      "name": "fixture",
+      "rows": 10000,
+      "tags": 20000,
+      "links": 100000,
+      "metadata_bytes": 1326,
+      "search_text_bytes": 4943,
+      "build_seconds": 0.798,
+      "db_mb": 97.1
+    },
+    {
+      "name": "fts_delete_batch_1",
+      "library_rows": 10000,
+      "median_ms": 10.058,
+      "samples_ms": [
+        10.058,
+        9.994,
+        10.124
+      ]
+    },
+    {
+      "name": "fts_delete_batch_100",
+      "library_rows": 10000,
+      "median_ms": 11.561,
+      "samples_ms": [
+        11.561,
+        11.971,
+        11.451
+      ]
+    },
+    {
+      "name": "fts_delete_batch_500",
+      "library_rows": 10000,
+      "median_ms": 18.157,
+      "samples_ms": [
+        18.103,
+        18.157,
+        18.623
+      ]
+    },
+    {
+      "name": "metadata_idle",
+      "library_rows": 10000,
+      "median_ms": 0.03,
+      "p95_ms": 0.044
+    },
+    {
+      "name": "stats_poll",
+      "library_rows": 10000,
+      "median_ms": 0.126,
+      "samples_ms": [
+        0.26,
+        0.126,
+        0.122
+      ]
+    },
+    {
+      "name": "processing_poll",
+      "library_rows": 10000,
+      "median_ms": 0.007,
+      "samples_ms": [
+        0.01,
+        0.007,
+        0.006
+      ]
+    },
+    {
+      "name": "all_tag_counts",
+      "library_rows": 10000,
+      "median_ms": 6.299,
+      "samples_ms": [
+        6.931,
+        6.299,
+        6.063
+      ]
+    },
+    {
+      "name": "fixture",
+      "rows": 260000,
+      "tags": 20000,
+      "links": 2600000,
+      "metadata_bytes": 1326,
+      "search_text_bytes": 4943,
+      "build_seconds": 35.69,
+      "db_mb": 2503.1
+    },
+    {
+      "name": "fts_delete_batch_1",
+      "library_rows": 260000,
+      "median_ms": 232.883,
+      "samples_ms": [
+        230.878,
+        232.883,
+        260.266
+      ]
+    },
+    {
+      "name": "fts_delete_batch_100",
+      "library_rows": 260000,
+      "median_ms": 265.617,
+      "samples_ms": [
+        267.995,
+        246.569,
+        265.617
+      ]
+    },
+    {
+      "name": "fts_delete_batch_500",
+      "library_rows": 260000,
+      "median_ms": 298.776,
+      "samples_ms": [
+        298.776,
+        291.72,
+        372.462
+      ]
+    },
+    {
+      "name": "metadata_idle",
+      "library_rows": 260000,
+      "median_ms": 0.033,
+      "p95_ms": 0.043
+    },
+    {
+      "name": "stats_poll",
+      "library_rows": 260000,
+      "median_ms": 4.012,
+      "samples_ms": [
+        4.532,
+        3.977,
+        4.012
+      ]
+    },
+    {
+      "name": "processing_poll",
+      "library_rows": 260000,
+      "median_ms": 0.452,
+      "samples_ms": [
+        0.578,
+        0.452,
+        0.421
+      ]
+    },
+    {
+      "name": "all_tag_counts",
+      "library_rows": 260000,
+      "median_ms": 42.836,
+      "samples_ms": [
+        43.593,
+        42.656,
+        42.836
+      ]
+    },
+    {
+      "name": "query_plans",
+      "plans": {
+        "fts_path": [
+          [
+            2,
+            0,
+            215,
+            "SCAN gallery_search VIRTUAL TABLE INDEX 0:"
+          ]
+        ],
+        "file_path": [
+          [
+            3,
+            0,
+            39,
+            "SEARCH files USING INDEX sqlite_autoindex_files_1 (path=?)"
+          ]
+        ],
+        "empty_folder": [
+          [
+            3,
+            0,
+            210,
+            "SCAN files USING COVERING INDEX idx_files_folder_size"
+          ]
+        ]
+      }
+    },
+    {
+      "name": "watcher_100_deleted_paths",
+      "seconds": 25.953,
+      "result": {
+        "queued": 0,
+        "removed": 100,
+        "folders": 0
+      },
+      "fts_delete_statements": 100
+    },
+    {
+      "name": "watcher_batch_prune_prototype_100",
+      "library_rows": 259900,
+      "median_ms": 267.925,
+      "samples_ms": [
+        268.689,
+        266.8,
+        267.925
+      ]
+    },
+    {
+      "name": "lookup_table_build",
+      "seconds": 0.397
+    },
+    {
+      "name": "indexed_fts_prototype_1",
+      "library_rows": 259900,
+      "median_ms": 0.059,
+      "samples_ms": [
+        0.115,
+        0.059,
+        0.044
+      ]
+    },
+    {
+      "name": "indexed_fts_prototype_100",
+      "library_rows": 259900,
+      "median_ms": 1.669,
+      "samples_ms": [
+        1.831,
+        1.669,
+        1.568
+      ]
+    },
+    {
+      "name": "indexed_fts_prototype_500",
+      "library_rows": 259900,
+      "median_ms": 8.123,
+      "samples_ms": [
+        8.339,
+        8.093,
+        8.123
+      ]
+    },
+    {
+      "name": "full_delete_fixture_1",
+      "total_ms": 304.556,
+      "fixture_file_io_ms": 0.114,
+      "database_ms": 304.442
+    },
+    {
+      "name": "full_delete_fixture_100",
+      "total_ms": 372.925,
+      "fixture_file_io_ms": 4.771,
+      "database_ms": 368.153
+    },
+    {
+      "name": "metadata_during_watcher_100",
+      "milliseconds": 25923.487
+    },
+    {
+      "name": "complete",
+      "database": "/private/tmp/cyberhub-gallery-perf-2026-09-28/synthetic-v2.db",
+      "note": "No actual user files or databases read or modified; prototypes exist only in this fixture."
+    }
+  ]
+}

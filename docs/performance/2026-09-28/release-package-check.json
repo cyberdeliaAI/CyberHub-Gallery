@@ -1,0 +1,14 @@
+{
+  "verified": true,
+  "installer": "CyberHub Settings 1.5.1",
+  "module_version": "1.2.15",
+  "installed_files": [
+    "modules/gallery/__init__.py",
+    "modules/gallery/requirements.txt"
+  ],
+  "existing_files_backed_up": 2,
+  "restart_required": true,
+  "module_registered_as_stable": true,
+  "user_data_untouched": true,
+  "zip_sha256": "d52e36018e5bb9b53d8711517c0db4752544a17787d7aa3be2fd965bb0a7b197"
+}

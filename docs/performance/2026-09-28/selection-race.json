@@ -1,0 +1,11 @@
+{
+  "reproduced": true,
+  "selected": "newest.png",
+  "rendered": "older.png",
+  "requests": 2,
+  "rendering_order": [
+    "newest.png",
+    "older.png"
+  ],
+  "interpretation": "An older metadata response overwrites the current selection panel."
+}

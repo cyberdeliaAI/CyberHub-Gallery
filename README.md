@@ -2,18 +2,22 @@
 
 Browse, search and manage local AI image collections.
 
-- Version: `1.2.14`
+- Version: `1.2.15`
 - Channel: `stable`
 - Publisher: `official`
 
 ## Installation
 
-1. Open **Module Manager** in CyberHub.
-2. Click **Check for updates**.
-3. Find **Gallery** and choose **Install** or **Update**.
-4. Restart CyberHub when the installation finishes.
+1. Open **Module Manager** in CyberHub and click **Check for updates**.
+2. Find **Gallery** and choose **Update** or **Install**.
+3. Restart CyberHub after installation.
 
-The ZIP attached to this repository's GitHub Release can also be imported manually through Settings.
+Requires CyberHub 1.3.0 or newer. The ZIP attached to the
+[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.2.15)
+can also be imported manually through **Settings**.
+
+See [the upgrade and test guide](docs/performance/2026-09-28/TESTEN.md) for installation,
+checks with an existing large library and rollback to 1.2.14.
 
 ## Gallery Layouts
 
@@ -34,12 +38,48 @@ both layouts. Group headings span all columns. Arrow keys follow the visible
 neighbouring cards in Masonry; Shift extends the selection in display order.
 Switching layouts preserves the current page and selection.
 
+## Performance improvements in 1.2.15
+
+- Gallery reads use independent SQLite snapshots, allowing browsing while discovery,
+  background processing and delete bookkeeping continue.
+- Changed files are registered in batches without repeatedly listing their directory.
+  Search entries are removed through an indexed path-to-row mapping; tag counts are
+  updated only for affected tags.
+- Selection previews use the existing thumbnail. Rapid selection changes coalesce
+  metadata requests, and late responses cannot replace a newer selection.
+- The open page refreshes as files arrive or finish processing, reusing unchanged
+  cards and preserving selection and the visible scroll position.
+- Missing thumbnails are queued for background processing, with bounded priority
+  and retries. Requests no longer decode an original on the HTTP thread. Existing
+  thumbnails are reused; there is still one thumbnail cache per image.
+- Deletes retain system-trash behavior and report partial failures. Their progress
+  no longer waits behind a whole watcher batch.
+
+No forced rescan, second thumbnail cache or Core change is required. At startup,
+Gallery refreshes a small lookup table from its existing search index; it does not
+reread the originals for this migration. Pausing/disabling background processing
+also pauses newly requested missing thumbnails; cached thumbnails remain visible.
+
 ## Development Checks
 
 Run the layout regression checks without installing npm packages:
 
 ```sh
-node --test tests/gallery_layout.test.cjs
+node --test tests/gallery_layout.test.cjs tests/gallery_interaction.test.cjs
+```
+
+Backend regression checks need the adjacent CyberHub repository and its Python
+dependencies (set `CYBERHUB_CORE_PATH` if it is elsewhere):
+
+```sh
+python -m unittest discover -s tests -p 'test_gallery_performance.py'
+```
+
+Optional synthetic database benchmark (260,000 rows, about 3 GB of temporary disk
+space; automatically removes the generated database after success):
+
+```sh
+python tests/benchmark_gallery.py --rows 260000 --output measurements.json
 ```
 
 For manual testing in CyberHub, use a folder with portrait, landscape and square

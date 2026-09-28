@@ -1,0 +1,120 @@
+{
+  "source": "/private/tmp/cyberhub-gallery-optimization/modules/gallery/__init__.py",
+  "version": "1.2.15-beta.1",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "sqlite": "3.53.4",
+  "synthetic": true,
+  "measurements": [
+    {
+      "name": "fixture",
+      "rows": 260000,
+      "tags": 20000,
+      "links": 2600000,
+      "metadata_bytes": 1326,
+      "search_text_bytes": 4943,
+      "build_seconds": 42.692,
+      "db_mb": 2530.2
+    },
+    {
+      "name": "fts_delete_batch_1",
+      "library_rows": 260000,
+      "median_ms": 0.073,
+      "samples_ms": [
+        0.159,
+        0.073,
+        0.068
+      ]
+    },
+    {
+      "name": "fts_delete_batch_100",
+      "library_rows": 260000,
+      "median_ms": 1.818,
+      "samples_ms": [
+        2.125,
+        1.706,
+        1.818
+      ]
+    },
+    {
+      "name": "fts_delete_batch_500",
+      "library_rows": 260000,
+      "median_ms": 8.897,
+      "samples_ms": [
+        9.576,
+        8.897,
+        8.832
+      ]
+    },
+    {
+      "name": "metadata_idle",
+      "median_ms": 0.05,
+      "p95_ms": 0.063
+    },
+    {
+      "name": "stats_poll",
+      "library_rows": 260000,
+      "median_ms": 4.973,
+      "samples_ms": [
+        34.095,
+        4.973,
+        4.427
+      ]
+    },
+    {
+      "name": "processing_poll",
+      "library_rows": 260000,
+      "median_ms": 0.064,
+      "samples_ms": [
+        0.745,
+        0.064,
+        0.037
+      ]
+    },
+    {
+      "name": "startup_existing_index",
+      "milliseconds": 543.82
+    },
+    {
+      "name": "watcher_100_deleted_paths",
+      "seconds": 0.068,
+      "result": {
+        "queued": 0,
+        "removed": 100,
+        "folders": 0
+      },
+      "fts_delete_statements": 1
+    },
+    {
+      "name": "metadata_during_watcher_100",
+      "milliseconds": 0.144
+    },
+    {
+      "name": "gallery_during_watcher_100",
+      "milliseconds": 4.385
+    },
+    {
+      "name": "full_delete_fixture_1",
+      "total_ms": 8.363,
+      "real_os_trash": false
+    },
+    {
+      "name": "full_delete_fixture_100",
+      "total_ms": 60.399,
+      "real_os_trash": false
+    },
+    {
+      "name": "watcher_100_added_paths",
+      "milliseconds": 4.857,
+      "result": {
+        "queued": 100,
+        "removed": 0,
+        "folders": 0
+      },
+      "directory_scans": 0
+    },
+    {
+      "name": "complete",
+      "note": "Only synthetic data used; temporary database removed. Real NAS/SSD file reads and OS trash need external testing."
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "current_watcher_new_images_100",
+    "batch_files": 100,
+    "directory_entries": 10000,
+    "directory_scans": 200,
+    "wal_read_ms": 0.02,
+    "metadata_wait_ms": 1282.918,
+    "queued": 100,
+    "removed": 0,
+    "folders": 0,
+    "seconds": 1.2834
+  },
+  {
+    "name": "deduplicated_folder_scans_prototype_100",
+    "batch_files": 100,
+    "directory_entries": 10000,
+    "directory_scans": 2,
+    "wal_read_ms": 0.019,
+    "metadata_wait_ms": 16.033,
+    "queued": 100,
+    "removed": 0,
+    "folders": 0,
+    "seconds": 0.0165
+  }
+]
