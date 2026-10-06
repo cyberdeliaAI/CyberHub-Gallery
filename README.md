@@ -2,7 +2,7 @@
 
 Browse, search and manage local AI image collections.
 
-- Version: `1.2.15`
+- Version: `1.2.16`
 - Channel: `stable`
 - Publisher: `official`
 
@@ -13,11 +13,29 @@ Browse, search and manage local AI image collections.
 3. Restart CyberHub after installation.
 
 Requires CyberHub 1.3.0 or newer. The ZIP attached to the
-[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.2.15)
+[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.2.16)
 can also be imported manually through **Settings**.
 
 See [the upgrade and test guide](docs/performance/2026-09-28/TESTEN.md) for installation,
 checks with an existing large library and rollback to 1.2.14.
+
+## Export positive prompts
+
+Select images with Ctrl/Cmd-click or Shift-click, then click **Export prompts**
+in the selection bar between **Compare** and **Clear**. The browser downloads
+`positive-prompts.txt` as UTF-8 text containing only the positive prompts, separated
+by a blank line. There are no filenames, headings, negative prompts or generation
+settings. Multiline prompts and special characters are preserved. Identical
+prompts from different images remain in the file, in selection order.
+
+Images with no available positive prompt are skipped and counted in the on-screen
+notification. If metadata is still processing, wait and export again. An empty
+selection of available prompts does not create an empty file. Export leaves the
+image selection intact.
+
+Export reads only the selected images' stored metadata in small indexed batches;
+it does not reopen original images, generate thumbnails or require a rescan.
+Up to 10,000 selected images can be exported per request.
 
 ## Gallery Layouts
 
@@ -72,7 +90,7 @@ Backend regression checks need the adjacent CyberHub repository and its Python
 dependencies (set `CYBERHUB_CORE_PATH` if it is elsewhere):
 
 ```sh
-python -m unittest discover -s tests -p 'test_gallery_performance.py'
+python -m unittest discover -s tests -p 'test_*.py'
 ```
 
 Optional synthetic database benchmark (260,000 rows, about 3 GB of temporary disk

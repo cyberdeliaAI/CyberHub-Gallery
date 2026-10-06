@@ -52,6 +52,7 @@ THUMB_SIZE = (300, 300)
 # installs default that directory to the portable CyberHub folder.
 DEFAULT_PER_PAGE = 200       # overwritten from settings on startup
 DEFAULT_REINDEX_INTERVAL = 30
+MAX_PROMPT_EXPORT_FILES = 10000
 # Shared by on-demand maintenance and background processing. A bounded set of
 # locks avoids duplicate encodes without retaining a lock for every library file.
 _THUMB_LOCKS = [threading.RLock() for _ in range(128)]
@@ -2017,6 +2018,77 @@ class GalleryDB:
             "processing_error": row[7] if row[6] == 2 else None,
         }
 
+    @staticmethod
+    def _positive_prompt(meta):
+        """Read supported stored metadata without exporting settings/workflow JSON."""
+        def is_json(value):
+            if not value.startswith(("{", "[")):
+                return False
+            try:
+                return isinstance(json.loads(value), (dict, list))
+            except (ValueError, TypeError):
+                return False
+
+        def from_parameters(parameters):
+            if not isinstance(parameters, str) or not parameters.strip():
+                return ""
+            parameters = parameters.replace("\r\n", "\n").replace("\r", "\n").strip()
+            # The shared parser treats a settings/negative-only record as a
+            # prompt. Such a record must not leak into a positive-only export.
+            if parameters.startswith(("Negative prompt:", "Steps:")):
+                return ""
+            prompt = parse_sd_parameters(parameters).get("prompt", "")
+            return prompt.strip() if isinstance(prompt, str) and not is_json(prompt.strip()) else ""
+
+        prompt = from_parameters(meta.get("parameters"))
+        if prompt:
+            return prompt
+        raw_prompt = meta.get("prompt")
+        if not isinstance(raw_prompt, str):
+            return ""
+        raw_prompt = raw_prompt.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if is_json(raw_prompt):
+            # Older indexed ComfyUI records may only contain the workflow.
+            refreshed = _metadata_mod.extract_comfyui_prompt(dict(meta))
+            return from_parameters(refreshed.get("parameters"))
+        return raw_prompt
+
+    def export_positive_prompts(self, paths):
+        """Export selected, completed records using indexed reads only."""
+        paths = list(dict.fromkeys(paths))
+        prompts = []
+        skipped = pending = 0
+        for offset in range(0, len(paths), 250):
+            batch = paths[offset:offset + 250]
+            placeholders = ",".join("?" for _ in batch)
+            with self._read_snapshot() as conn:
+                rows = dict((row[0], row[1:]) for row in conn.execute(
+                    f"SELECT path,metadata_json,processing_state FROM files WHERE path IN ({placeholders})",
+                    batch,
+                ))
+            # Parse outside the read transaction; maintain selection order and
+            # duplicate prompts from different images, never add file names.
+            for path in batch:
+                row = rows.get(path)
+                if row and row[1] == 0:
+                    pending += 1
+                    skipped += 1
+                    continue
+                prompt = ""
+                if row and row[1] == 1:
+                    try:
+                        prompt = self._positive_prompt(self._safe_meta_load(row[0]))
+                    except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+                        # One unsupported/malformed record must not lose the
+                        # other selected prompts or export its raw metadata.
+                        pass
+                if prompt:
+                    prompts.append(prompt)
+                else:
+                    skipped += 1
+        return {"text": "\n\n".join(prompts), "exported": len(prompts),
+                "skipped": skipped, "pending": pending}
+
     def get_stats(self):
         with self._read_snapshot() as conn:
             files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
@@ -2978,6 +3050,7 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
     padding:8px 16px; display:none; align-items:center; gap:12px; z-index:900;
     box-shadow:0 8px 32px rgba(0,0,0,.5); font-size:12px;
     animation:toast-in .2s ease-out;
+    width:max-content; max-width:calc(100vw - 32px); flex-wrap:wrap; justify-content:center;
 }
 .selection-bar.visible { display:flex; }
 .selection-bar .sel-count { color:var(--orange); font-family:var(--mono); font-weight:600; }
@@ -2986,6 +3059,7 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
     font-size:11px; padding:4px 12px; border-radius:var(--radius); cursor:pointer; transition:all .15s;
 }
 .selection-bar .sel-btn:hover { background:var(--bg-hover); }
+.selection-bar .sel-btn:disabled { opacity:.55; cursor:default; }
 .selection-bar .sel-btn.danger { border-color:var(--red); color:var(--red); }
 .selection-bar .sel-btn.danger:hover { background:rgba(239,68,68,.15); }
 
@@ -3188,6 +3262,7 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
     <button class="sel-btn" id="selRemColl" style="display:none">&#x2716; Remove from collection</button>
     <button class="sel-btn" id="selAutoTag" style="display:none">AI Tag</button>
     <button class="sel-btn" id="selCompare" onclick="openCompare()">&#x1F50D; Compare</button>
+    <button class="sel-btn" id="selExportPrompts" title="Download positive prompts as a TXT file">Export prompts</button>
     <button class="sel-btn" id="selClear">Clear</button>
     <button class="sel-btn danger" id="selDelete">&#x1F5D1; Delete</button>
 </div>
@@ -3287,6 +3362,7 @@ var searchMode = false;
 var searchQuery = '';
 var searchFolderFilter = null;
 var multiSelected = new Set(); // Set of file paths
+var exportPromptsBusy = false;
 var hasTrash = true; // Updated at init from server
 var metaCache = {}; // bounded, completed metadata only
 var metaRequestId = 0;
@@ -5071,7 +5147,7 @@ var deletePreferredPath = null;
 
 function setDeleteControls(disabled) {
     document.querySelectorAll('#selectionBar button').forEach(function(button) {
-        button.disabled = !!disabled;
+        button.disabled = !!disabled || (button.id === 'selExportPrompts' && exportPromptsBusy);
     });
     var metaButton = document.getElementById('metaDeleteBtn');
     if (metaButton) metaButton.disabled = !!disabled;
@@ -5218,6 +5294,47 @@ async function executeDelete(paths) {
 }
 
 // Selection bar buttons
+async function exportSelectedPrompts() {
+    if (exportPromptsBusy || deleteStarting || deleteObservedActive || !multiSelected.size) return;
+    var paths = Array.from(multiSelected);
+    var button = document.getElementById('selExportPrompts');
+    exportPromptsBusy = true;
+    button.disabled = true;
+    button.textContent = 'Exporting...';
+    try {
+        var result = await API.post('/api/gallery/export-prompts', {paths:paths});
+        if (!result) return;
+        if (!result.exported || !result.text) {
+            showToast(result.pending ? 'No positive prompts available yet. Wait for processing and try again.' : 'No positive prompts found in the selected images.');
+            return;
+        }
+        var blob = new Blob([result.text], {type:'text/plain;charset=utf-8'});
+        var url = URL.createObjectURL(blob);
+        var link = document.createElement('a');
+        link.href = url;
+        link.download = 'positive-prompts.txt';
+        document.body.appendChild(link);
+        try { link.click(); } finally {
+            link.remove();
+            setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+        }
+        var message = result.exported + ' prompt' + (result.exported === 1 ? '' : 's') + ' exported';
+        if (result.skipped) message += ' · ' + result.skipped + ' skipped (no available positive prompt)';
+        if (result.pending) message += ' · ' + result.pending + ' still processing';
+        showToast(message);
+    } catch (error) {
+        showToast('Export failed: ' + error.message);
+    } finally {
+        exportPromptsBusy = false;
+        button.disabled = deleteStarting || deleteObservedActive;
+        button.textContent = 'Export prompts';
+    }
+}
+document.getElementById('selExportPrompts').addEventListener('click', exportSelectedPrompts);
+document.getElementById('selExportPrompts').addEventListener('keydown', function(event) {
+    // Enter activates this button without also opening the selected image.
+    if (event.key === 'Enter' || event.key === ' ') event.stopPropagation();
+});
 document.getElementById('selClear').addEventListener('click', clearMultiSelect);
 document.getElementById('selDelete').addEventListener('click', function() {
     if (multiSelected.size > 0) confirmDelete(Array.from(multiSelected));
@@ -5781,7 +5898,7 @@ class GalleryModule(Module):
     """Module wrapper around GalleryDB + the HTML gallery UI."""
 
     name = "Gallery"
-    version = "1.2.15"
+    version = "1.2.16"
     release_stage = "stable"
     icon = "\U0001F5BC"   # 🖼
     description = "Browse and manage your AI-generated image collection."
@@ -6158,6 +6275,7 @@ class GalleryModule(Module):
 
     def routes_post(self):
         return {
+            "/api/gallery/export-prompts": self._api_export_prompts,
             "/api/reindex": self._api_reindex,
             "/api/rebuild_search": self._api_rebuild_search,
             "/api/optimize_db": self._api_optimize_db,
@@ -6549,6 +6667,18 @@ class GalleryModule(Module):
         self._delete_thread = threading.Thread(target=run, daemon=True)
         self._delete_thread.start()
         return True
+
+    def _api_export_prompts(self, handler, content_len, content_type):
+        if not self._require_db(handler): return
+        data = handler.read_body_json(content_len)
+        paths = data.get("paths") if isinstance(data, dict) else None
+        if not isinstance(paths, list) or not paths or any(not isinstance(p, str) or not p for p in paths):
+            handler.respond_json({"error": "Select images to export their positive prompts."}, status=400)
+            return
+        if len(paths) > MAX_PROMPT_EXPORT_FILES:
+            handler.respond_json({"error": f"Select at most {MAX_PROMPT_EXPORT_FILES:,} images per export."}, status=400)
+            return
+        handler.respond_json(self.db.export_positive_prompts(paths))
 
     def _api_delete_start(self, handler, content_len, content_type):
         if not self._require_db(handler): return

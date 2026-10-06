@@ -141,3 +141,55 @@ test('completed processing refreshes only the changed card and empty results cle
     x.context.renderGalleryFiles([],0,false,true);
     assert.equal(x.grid.children.length,0);
 });
+
+function promptExport() {
+    const button={disabled:false,textContent:'Export prompts'};
+    const requests=[],downloads=[],blobs=[],toasts=[],revoked=[],timers=[];
+    const context=install({
+        exportPromptsBusy:false,deleteStarting:false,deleteObservedActive:false,
+        multiSelected:new Set(['Images/a.png','Images/b.png']),
+        Blob, URL:{createObjectURL(blob){blobs.push(blob);return 'blob:prompts'},revokeObjectURL(url){revoked.push(url)}},
+        document:{getElementById(){return button},body:{appendChild(){}},createElement(){return {click(){downloads.push({name:this.download,url:this.href})},remove(){}}}},
+        API:{post(url,body){return new Promise(resolve=>requests.push({url,body,resolve}))}},
+        showToast(message){toasts.push(message)},setTimeout(fn){timers.push(fn)},
+    },'exportSelectedPrompts');
+    return {context,button,requests,downloads,blobs,toasts,revoked,timers};
+}
+test('export downloads only the returned positive text and snapshots the selection',async()=>{
+    const x=promptExport();
+    const task=x.context.exportSelectedPrompts();
+    assert.equal(x.button.disabled,true);
+    x.context.multiSelected.clear();
+    x.context.multiSelected.add('Images/c.png');
+    await x.context.exportSelectedPrompts();
+    assert.equal(x.requests.length,1);
+    assert.deepEqual(Array.from(x.requests[0].body.paths),['Images/a.png','Images/b.png']);
+    x.requests[0].resolve({text:'café in rain\n\n猫 in garden',exported:2,skipped:0,pending:0});
+    await task;
+    assert.equal(await x.blobs[0].text(),'café in rain\n\n猫 in garden');
+    assert.equal(x.blobs[0].type,'text/plain;charset=utf-8');
+    assert.deepEqual(x.downloads,[{name:'positive-prompts.txt',url:'blob:prompts'}]);
+    assert.equal(x.button.disabled,false);
+    assert.deepEqual(Array.from(x.context.multiSelected),['Images/c.png']);
+    x.timers.forEach(fn=>fn());
+    assert.deepEqual(x.revoked,['blob:prompts']);
+});
+test('empty or failed export never downloads a blank file and allows retry',async()=>{
+    for(const response of [null,{text:'',exported:0,skipped:2,pending:1}]) {
+        const x=promptExport();const task=x.context.exportSelectedPrompts();
+        x.requests[0].resolve(response);await task;
+        assert.equal(x.downloads.length,0);
+        assert.equal(x.button.disabled,false);
+        assert.equal(x.button.textContent,'Export prompts');
+        assert.equal(x.context.exportPromptsBusy,false);
+    }
+});
+test('skipped images are reported outside the clean TXT content',async()=>{
+    const x=promptExport();const task=x.context.exportSelectedPrompts();
+    x.context.deleteObservedActive=true;
+    x.requests[0].resolve({text:'only this prompt',exported:1,skipped:2,pending:1});await task;
+    assert.equal(await x.blobs[0].text(),'only this prompt');
+    assert.match(x.toasts[0],/2 skipped/);
+    assert.match(x.toasts[0],/1 still processing/);
+    assert.equal(x.button.disabled,true);
+});
