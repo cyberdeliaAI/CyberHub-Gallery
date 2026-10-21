@@ -69,6 +69,18 @@ def thumbnail_is_current(thumb_path, source_mtime):
         return False
 
 
+def thumbnail_is_readable(thumb_path):
+    """Decode cached WebP pixels during explicit maintenance, never HTTP reads."""
+    try:
+        with Image.open(thumb_path) as image:
+            if image.format != "WEBP":
+                return False
+            image.load()
+        return True
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return False
+
+
 class _SourceChanged(Exception):
     def __init__(self, path):
         self.path = path
@@ -902,12 +914,12 @@ class GalleryDB:
             )
 
     def generate_missing_thumbnails(self, workers=None, progress=None):
-        """Generate stale/missing thumbnails from indexed files in bounded batches.
+        """Repair stale/missing/unreadable thumbnails in bounded indexed batches.
 
         The old maintenance path walked every gallery root twice and retained all
         source paths in memory. SQLite already owns that inventory, so this pass
-        streams rows by rowid and only opens images whose thumbnail is missing or
-        older than the source file.
+        streams rows by rowid. Current cached WebPs are decoded to detect damaged
+        pixels; originals are only opened when the cache needs regeneration.
         """
         if not HAS_PIL:
             return {"ok": False, "error": "Pillow is required for thumbnail generation"}
@@ -933,15 +945,17 @@ class GalleryDB:
             if not abs_path or not os.path.isfile(abs_path):
                 return "error"
             thumb_path = get_thumb_path(self.thumb_dir, file_path)
-            try:
-                if (
-                    os.path.isfile(thumb_path)
-                    and os.path.getmtime(thumb_path) >= os.path.getmtime(abs_path)
-                ):
+            with thumbnail_lock(file_path):
+                try:
+                    source_mtime = os.path.getmtime(abs_path)
+                except OSError:
+                    return "error"
+                if (thumbnail_is_current(thumb_path, source_mtime)
+                        and thumbnail_is_readable(thumb_path)):
                     return "skipped"
-            except OSError:
-                pass
-            result = ensure_thumbnail(self.thumb_dir, file_path, abs_path)
+                # The timestamp alone cannot identify damaged cache entries.
+                # Hold the shared lock until atomic replacement is complete.
+                result = ensure_thumbnail(self.thumb_dir, file_path, abs_path, force=True)
             return "generated" if result == thumb_path and os.path.isfile(thumb_path) else "error"
 
         report("prepare", "Checking indexed thumbnails")
@@ -2575,7 +2589,7 @@ def migrate_thumb_layout(thumb_dir):
             pass
     print(f"[MIGRATE] Done. {moved} thumbnails moved to {len(set(f[:2] for f in flat_files))} subfolders.")
 
-def ensure_thumbnail(thumb_dir, db_path, abs_path):
+def ensure_thumbnail(thumb_dir, db_path, abs_path, *, force=False):
     if not HAS_PIL or not abs_path:
         return None
     with thumbnail_lock(db_path):
@@ -2583,7 +2597,7 @@ def ensure_thumbnail(thumb_dir, db_path, abs_path):
         temporary = f"{thumb}.{threading.get_ident()}.tmp"
         try:
             before = os.stat(abs_path)
-            if thumbnail_is_current(thumb, before.st_mtime):
+            if not force and thumbnail_is_current(thumb, before.st_mtime):
                 return thumb
             os.makedirs(os.path.dirname(thumb), exist_ok=True)
             with Image.open(abs_path) as image:
@@ -5898,7 +5912,7 @@ class GalleryModule(Module):
     """Module wrapper around GalleryDB + the HTML gallery UI."""
 
     name = "Gallery"
-    version = "1.2.16"
+    version = "1.2.17"
     release_stage = "stable"
     icon = "\U0001F5BC"   # 🖼
     description = "Browse and manage your AI-generated image collection."

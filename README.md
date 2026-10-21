@@ -2,7 +2,7 @@
 
 Browse, search and manage local AI image collections.
 
-- Version: `1.2.16`
+- Version: `1.2.17`
 - Channel: `stable`
 - Publisher: `official`
 
@@ -13,7 +13,7 @@ Browse, search and manage local AI image collections.
 3. Restart CyberHub after installation.
 
 Requires CyberHub 1.3.0 or newer. The ZIP attached to the
-[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.2.16)
+[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.2.17)
 can also be imported manually through **Settings**.
 
 See [the upgrade and test guide](docs/performance/2026-09-28/TESTEN.md) for installation,
@@ -55,6 +55,27 @@ Search, metadata filters, favorites, collections and model grouping work in
 both layouts. Group headings span all columns. Arrow keys follow the visible
 neighbouring cards in Masonry; Shift extends the selection in display order.
 Switching layouts preserves the current page and selection.
+
+## Thumbnail repair in 1.2.17 (21 October 2026)
+
+The fix for [issue #4](https://github.com/cyberdeliaAI/CyberHub/issues/4) makes **Generate All Thumbs** check that current
+cached WebP thumbnails can actually be decoded. Empty, truncated or unreadable
+cache files are regenerated alongside missing or stale thumbnails. Valid current
+thumbnails are kept, and their original images are not decoded again.
+
+Run **Settings → Maintenance → Generate All Thumbs** after updating Gallery
+and restarting CyberHub. When it finishes, force-refresh the Gallery page so the
+browser discards any previously cached broken image response. No image removal,
+database cleanup or full reindex is needed. Existing failed-repair counts remain
+available in the maintenance result; unreadable originals cannot be repaired by
+regenerating a thumbnail.
+
+Validation only runs during this explicit maintenance pass. Normal thumbnail
+requests retain their existing fast path. Replacement remains atomic under the
+per-thumbnail lock, and a failed encode/write leaves the previous cache file in
+place. The patch does not modify image files, metadata, favorites or collections.
+Update Gallery through Module Manager or import the 1.2.17 release ZIP through
+Settings. No Core update is required for this Gallery correction.
 
 ## Performance improvements in 1.2.15
 

@@ -273,6 +273,123 @@ class GalleryPerformanceTests(unittest.TestCase):
         self.assertTrue(thumb.exists())
         self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM gallery_search').fetchone()[0], 1)
 
+    def test_thumbnail_maintenance_repairs_empty_corrupt_and_truncated_cache(self):
+        path, rel = self.add()
+        thumb = Path(g.get_thumb_path(self.db.thumb_dir, rel))
+        original = path.read_bytes()
+        valid_thumb = thumb.read_bytes()
+        self.conn.execute('UPDATE files SET favorite=1 WHERE path=?', (rel,))
+        self.conn.commit()
+        row = self.conn.execute('SELECT * FROM files WHERE path=?', (rel,)).fetchone()
+        for broken in (b'', b'not a WebP image', valid_thumb[:20], original):
+            with self.subTest(broken=broken):
+                thumb.write_bytes(broken)
+                os.utime(thumb, (path.stat().st_mtime + 1,) * 2)
+                with patch.object(g, 'get_image_metadata', side_effect=AssertionError('Metadata reread')):
+                    report = self.db.generate_missing_thumbnails(workers=1)
+                self.assertEqual((report['generated'], report['skipped'], report['errors']), (1, 0, 0))
+                with g.Image.open(thumb) as repaired:
+                    repaired.load()
+                    self.assertEqual(repaired.format, 'WEBP')
+                    self.assertEqual(repaired.size, (60, 90))
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(self.conn.execute('SELECT * FROM files WHERE path=?', (rel,)).fetchone(), row)
+                self.assertEqual(list(thumb.parent.glob('*.tmp')), [])
+
+    def test_thumbnail_maintenance_recovers_from_oversized_cache_header(self):
+        path, rel = self.add()
+        thumb = Path(g.get_thumb_path(self.db.thumb_dir, rel))
+        open_image = g.Image.open
+        def reject_cache(filename, *args, **kwargs):
+            if str(filename) == str(thumb):
+                raise g.Image.DecompressionBombError('Oversized cache fixture')
+            return open_image(filename, *args, **kwargs)
+        with patch.object(g.Image, 'open', side_effect=reject_cache):
+            report = self.db.generate_missing_thumbnails(workers=1)
+        self.assertEqual((report['generated'], report['skipped'], report['errors']), (1, 0, 0))
+        with g.Image.open(thumb) as image:
+            image.load()
+
+    def test_concurrent_thumbnail_maintenance_encodes_broken_cache_once(self):
+        _, rel = self.add()
+        thumb = Path(g.get_thumb_path(self.db.thumb_dir, rel))
+        thumb.write_bytes(b'broken cached WebP')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            jobs = [pool.submit(self.db.generate_missing_thumbnails, workers=1) for _ in range(2)]
+            reports = [job.result(timeout=3) for job in jobs]
+        self.assertEqual(sum(r['generated'] for r in reports), 1)
+        self.assertEqual(sum(r['skipped'] for r in reports), 1)
+        self.assertEqual(sum(r['errors'] for r in reports), 0)
+
+    def test_thumbnail_maintenance_reuses_readable_current_cache_without_original_decode(self):
+        path, rel = self.add()
+        thumb = Path(g.get_thumb_path(self.db.thumb_dir, rel))
+        before = (thumb.read_bytes(), thumb.stat().st_mtime_ns)
+        open_image = g.Image.open
+        def open_cache_only(filename, *args, **kwargs):
+            if str(filename) == str(path):
+                raise AssertionError('Unnecessary original decode')
+            return open_image(filename, *args, **kwargs)
+        with patch.object(g.Image, 'open', side_effect=open_cache_only):
+            report = self.db.generate_missing_thumbnails(workers=1)
+        self.assertEqual((report['generated'], report['skipped'], report['errors']), (0, 1, 0))
+        self.assertEqual((thumb.read_bytes(), thumb.stat().st_mtime_ns), before)
+
+    def test_thumbnail_maintenance_generates_missing_and_stale_cache(self):
+        path, rel = self.add()
+        thumb = Path(g.get_thumb_path(self.db.thumb_dir, rel))
+        for missing in (True, False):
+            with self.subTest(missing=missing):
+                if missing:
+                    thumb.unlink()
+                else:
+                    os.utime(thumb, (path.stat().st_mtime - 10,) * 2)
+                report = self.db.generate_missing_thumbnails(workers=1)
+                self.assertEqual((report['generated'], report['skipped'], report['errors']), (1, 0, 0))
+                with g.Image.open(thumb) as image:
+                    image.load()
+
+    def test_thumbnail_maintenance_counts_failed_repair_and_continues(self):
+        path, rel = self.add()
+        other, other_rel = self.add('other.png')
+        thumb = Path(g.get_thumb_path(self.db.thumb_dir, rel))
+        other_thumb = Path(g.get_thumb_path(self.db.thumb_dir, other_rel))
+        thumb.write_bytes(b'corrupt cache')
+        path.write_bytes(b'unreadable original')
+        other_thumb.unlink()
+        report = self.db.generate_missing_thumbnails(workers=1)
+        self.assertEqual((report['generated'], report['skipped'], report['errors']), (1, 0, 1))
+        self.assertEqual(thumb.read_bytes(), b'corrupt cache')
+        self.assertEqual(path.read_bytes(), b'unreadable original')
+        self.assertEqual(list(thumb.parent.glob('*.tmp')), [])
+        with g.Image.open(other_thumb) as image:
+            image.load()
+
+    def test_thumbnail_repair_keeps_previous_cache_when_atomic_replace_fails(self):
+        path, rel = self.add()
+        thumb = Path(g.get_thumb_path(self.db.thumb_dir, rel))
+        thumb.write_bytes(b'previous cache')
+        with patch.object(g.os, 'replace', side_effect=OSError('Fixture write failure')):
+            report = self.db.generate_missing_thumbnails(workers=1)
+        self.assertEqual(report['errors'], 1)
+        self.assertEqual(report['generated'], 0)
+        self.assertEqual(thumb.read_bytes(), b'previous cache')
+        self.assertEqual(list(thumb.parent.glob('*.tmp')), [])
+
+    def test_cached_thumbnail_route_does_not_decode_images(self):
+        _, rel = self.add()
+        thumb = Path(g.get_thumb_path(self.db.thumb_dir, rel))
+        module = g.GalleryModule(object())
+        module.db = self.db
+        module.thumb_dir = self.db.thumb_dir
+        class Handler:
+            def serve_file(self, filename):
+                self.filename = filename
+        handler = Handler()
+        with patch.object(g.Image, 'open', side_effect=AssertionError('HTTP image decode')):
+            module._handle_thumb(handler, rel)
+        self.assertEqual(handler.filename, str(thumb))
+
     def test_rollback_then_upgrade_relinks_search_rowids(self):
         _, rel = self.add()
         self.conn.execute('DELETE FROM gallery_search')
