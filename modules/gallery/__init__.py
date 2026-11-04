@@ -429,6 +429,15 @@ class GalleryDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_fc_collection ON file_collections(collection_id);
                 CREATE INDEX IF NOT EXISTS idx_fc_file ON file_collections(file_path);
+                CREATE TABLE IF NOT EXISTS gallery_manual_tags (
+                    name TEXT PRIMARY KEY, last_used REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_manual_tags_recent ON gallery_manual_tags(last_used DESC, name);
+                CREATE TABLE IF NOT EXISTS gallery_manual_file_tags (
+                    file_path TEXT NOT NULL, tag_name TEXT NOT NULL,
+                    PRIMARY KEY (file_path, tag_name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_manual_file_tags_name ON gallery_manual_file_tags(tag_name, file_path);
             """)
             # Migration: add favorite column to existing DBs (must run before index creation)
             try:
@@ -1726,6 +1735,7 @@ class GalleryDB:
             )]
             conn.executemany("DELETE FROM file_tags WHERE file_path=?", [(path,) for path in batch])
             conn.executemany("DELETE FROM file_collections WHERE file_path=?", [(path,) for path in batch])
+            conn.executemany("DELETE FROM gallery_manual_file_tags WHERE file_path=?", [(path,) for path in batch])
             self._delete_search_many(conn, batch)
             conn.executemany("DELETE FROM files WHERE path=?", [(path,) for path in batch])
             self._refresh_changed_tags(conn, tag_ids)
@@ -2456,6 +2466,121 @@ class GalleryDB:
         self._search_cache_key = None
         return results
 
+    # ─── Manual image tags (independent of extracted and AI tags) ──────────────
+
+    @staticmethod
+    def normalize_manual_tags(tags):
+        if not isinstance(tags, list) or not tags or len(tags) > 20:
+            raise ValueError("Provide between 1 and 20 tags.")
+        result = []
+        for tag in tags:
+            if not isinstance(tag, str):
+                raise ValueError("Tags must be text.")
+            tag = re.sub(r"\s+", "_", tag.strip()).casefold()
+            if not tag or len(tag) > 80 or re.search(r"[\x00-\x1f\x7f,]", tag):
+                raise ValueError("Tags must contain 1–80 characters, without commas or control characters.")
+            if tag not in result:
+                result.append(tag)
+        return result
+
+    def get_manual_tags(self, file_path):
+        with self._read_snapshot() as conn:
+            if not conn.execute("SELECT 1 FROM files WHERE path=?", (file_path,)).fetchone():
+                return None
+            rows = conn.execute(
+                "SELECT tag_name FROM gallery_manual_file_tags WHERE file_path=? ORDER BY tag_name",
+                (file_path,),
+            ).fetchall()
+        return {"path": file_path, "tags": [row[0] for row in rows]}
+
+    def suggest_manual_tags(self, prefix="", limit=24):
+        prefix = re.sub(r"\s+", "_", prefix.strip()).casefold()[:80]
+        prefix = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        with self._read_snapshot() as conn:
+            rows = conn.execute("""
+                SELECT t.name, (SELECT COUNT(*) FROM gallery_manual_file_tags ft WHERE ft.tag_name=t.name)
+                FROM gallery_manual_tags t WHERE t.name LIKE ? ESCAPE '\\'
+                ORDER BY t.last_used DESC, t.name LIMIT ?
+            """, (prefix + "%", max(1, min(50, int(limit))))).fetchall()
+        return [{"name": row[0], "count": row[1]} for row in rows]
+
+    def update_manual_tags(self, paths, tags, action="add"):
+        tags = self.normalize_manual_tags(tags)
+        if action not in ("add", "remove"):
+            raise ValueError("Tag action must be add or remove.")
+        if (not isinstance(paths, list) or not paths or len(paths) > 10000
+                or any(not isinstance(path, str) or not path or len(path) > 4096 for path in paths)):
+            raise ValueError("Select between 1 and 10,000 indexed images.")
+        paths = list(dict.fromkeys(paths))
+        conn = self._get_conn()
+        changed = 0
+        matched = []
+        with self.lock:
+            try:
+                for offset in range(0, len(paths), 500):
+                    batch = paths[offset:offset + 500]
+                    placeholders = ",".join("?" for _ in batch)
+                    matched.extend(row[0] for row in conn.execute(
+                        f"SELECT path FROM files WHERE path IN ({placeholders})", batch))
+                if matched:
+                    if action == "add":
+                        now = time.time()
+                        conn.executemany("""
+                            INSERT INTO gallery_manual_tags(name,last_used) VALUES (?,?)
+                            ON CONFLICT(name) DO UPDATE SET last_used=excluded.last_used
+                        """, [(tag, now) for tag in tags])
+                    for offset in range(0, len(matched), 500):
+                        pairs = [(path, tag) for path in matched[offset:offset + 500] for tag in tags]
+                        if action == "add":
+                            cursor = conn.executemany(
+                                "INSERT OR IGNORE INTO gallery_manual_file_tags(file_path,tag_name) VALUES (?,?)", pairs)
+                        else:
+                            cursor = conn.executemany(
+                                "DELETE FROM gallery_manual_file_tags WHERE file_path=? AND tag_name=?", pairs)
+                        changed += cursor.rowcount
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            if changed:
+                self._mark_changed()
+        return {"ok": True, "tags": tags, "action": action, "changed": changed,
+                "matched": len(matched), "skipped": len(paths) - len(matched)}
+
+    def get_manual_tag_files(self, tags, folder="", page=1, per_page=DEFAULT_PER_PAGE,
+                             sort="date", order="desc", include_model_info=False, metadata_filter="all"):
+        tags = self.normalize_manual_tags(tags)
+        page, per_page = max(1, int(page)), max(1, min(1000, int(per_page)))
+        placeholders = ",".join("?" for _ in tags)
+        clauses = [f"""f.path IN (
+            SELECT file_path FROM gallery_manual_file_tags WHERE tag_name IN ({placeholders})
+            GROUP BY file_path HAVING COUNT(*)=?
+        )"""]
+        params = tags + [len(tags)]
+        if folder:
+            # Literal prefix matching: underscores and % in folder names are not wildcards.
+            clauses.append("(f.folder=? OR substr(f.folder,1,?)=?)")
+            params.extend([folder, len(folder) + 1, folder + "/"])
+        metadata = self._metadata_filter_sql(metadata_filter, "f")
+        if metadata:
+            clauses.append(metadata)
+        where = " AND ".join(clauses)
+        sort_col = {"name": "name", "date": "mtime", "size": "size", "favorite": "favorite"}.get(sort, "mtime")
+        order_dir = "ASC" if order == "asc" else "DESC"
+        sort_expr = "f.favorite DESC, f.mtime DESC" if sort == "favorite" else f"f.{sort_col} {order_dir}"
+        model_cols = ", f.model_name, f.model_family" if include_model_info else ""
+        revision = self.revision
+        with self._read_snapshot() as conn:
+            total = conn.execute(f"SELECT COUNT(*) FROM files f WHERE {where}", params).fetchone()[0]
+            rows = conn.execute(f"""
+                SELECT f.path,f.name,f.folder,f.ext,f.size,f.mtime,f.width,f.height,
+                       f.has_metadata,f.favorite,f.processing_state{model_cols}
+                FROM files f WHERE {where} ORDER BY {sort_expr}, f.path ASC LIMIT ? OFFSET ?
+            """, params + [per_page, (page - 1) * per_page]).fetchall()
+        return {"revision": revision, "files": [self._file_dict(row, include_model_info) for row in rows],
+                "total": total, "page": page, "pages": max(1, (total + per_page - 1) // per_page),
+                "per_page": per_page, "tags": tags}
+
     # ─── Collections ──────────────────────────────────────────────────────────
 
     def create_collection(self, name, color="#4a9eff"):
@@ -2898,6 +3023,28 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 .coll-add-btn:hover { background:var(--bg-hover); }
 
 /* Collection picker dropdown in selection bar */
+.manual-tag-editor { padding:10px 12px; border-bottom:1px solid var(--border); }
+.manual-tag-editor h3 { margin:0 0 7px; color:var(--text-dim); font-size:11px; }
+.manual-tag-list { display:flex; flex-wrap:wrap; gap:5px; margin:7px 0; }
+.manual-tag-chip { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; max-width:100%; }
+.manual-tag-chip button, .manual-recent button { border:0; background:var(--bg-card); color:var(--text); padding:4px 7px; font:11px var(--mono); cursor:pointer; overflow-wrap:anywhere; }
+.manual-tag-chip button:hover, .manual-recent button:hover { background:var(--bg-hover); color:var(--accent); }
+.manual-tag-chip button:focus-visible, .manual-recent button:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+.manual-tag-entry { display:flex; gap:5px; }
+.manual-tag-input { min-width:0; flex:1; border:1px solid var(--border); border-radius:5px; padding:6px; background:var(--bg-darkest); color:var(--text); font:12px var(--font); }
+.manual-tag-entry button, .manual-tag-actions button { border:1px solid var(--border); border-radius:5px; background:var(--bg-card); color:var(--text); padding:6px 9px; cursor:pointer; }
+.manual-recent { display:flex; flex-wrap:wrap; gap:4px; margin-top:5px; }
+.manual-recent button { border:1px solid var(--border); border-radius:5px; }
+.manual-tag-hint { font:11px var(--font); color:var(--text-dim); margin:7px 0 4px; }
+.manual-tag-dialog { width:min(480px,calc(100vw - 32px)); box-sizing:border-box; border:1px solid var(--border); border-radius:10px; padding:20px; background:var(--bg-panel); color:var(--text); }
+.manual-tag-dialog::backdrop { background:rgba(0,0,0,.65); }
+.manual-tag-dialog h2 { margin:0 0 8px; font-size:17px; }
+.manual-tag-dialog .manual-tag-input { width:100%; box-sizing:border-box; }
+.manual-tag-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:16px; }
+.manual-tag-actions .primary { background:var(--accent); color:var(--bg-darkest); }
+[data-manual-control]:disabled { opacity:.55; cursor:wait; }
+#manualTagsBtn.active { color:var(--accent); border-color:var(--accent); }
+#manualTagsBtn { width:100%; text-align:left; background:none; border-top:0; border-right:0; border-bottom:0; font-family:inherit; }
 .coll-picker { position:relative; }
 .coll-picker-menu { position:absolute; bottom:100%; left:0; background:var(--bg-panel); border:1px solid var(--border); border-radius:var(--radius); min-width:180px; max-height:240px; overflow-y:auto; box-shadow:0 8px 24px rgba(0,0,0,.5); display:none; margin-bottom:4px; z-index:910; }
 .coll-picker-menu.open { display:block; }
@@ -3177,6 +3324,10 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
                 <span>Favorites</span>
                 <span class="ss-count" id="favCount">0</span>
             </div>
+            <button class="sidebar-special" id="manualTagsBtn" title="Filter by your own image tags" aria-label="Filter my tags">
+                <span class="ss-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 3h8l10 10-8 8L3 11z"/><circle cx="7" cy="7" r="1"/></svg></span>
+                <span id="manualTagsLabel">My tags</span>
+            </button>
             <div class="sidebar-special" id="navToday">
                 <span class="ss-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M8 3v4M16 3v4M4 10h16"/><path d="M9 14h1M14 14h1M9 17h1"/></svg></span>
                 <span>Today</span>
@@ -3264,6 +3415,24 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
     </div>
 </div>
 
+<dialog class="manual-tag-dialog" id="manualTagDialog" aria-labelledby="manualTagDialogTitle">
+    <h2 id="manualTagDialogTitle">My tags</h2>
+    <p class="manual-tag-hint" id="manualTagDialogHint"></p>
+    <label class="manual-tag-hint" id="manualTagScope"><input type="checkbox" id="manualTagAllFolders"> All folders</label>
+    <label class="manual-tag-hint" for="manualTagDialogInput">Tags (separate multiple tags with commas)</label>
+    <input class="manual-tag-input" id="manualTagDialogInput" list="manualDialogSuggestions" placeholder="great_pose, great_clothes" maxlength="1620" autocomplete="off">
+    <datalist id="manualDialogSuggestions"></datalist>
+    <p class="manual-tag-hint">Recently used · click to choose</p>
+    <div class="manual-recent" id="manualTagDialogRecent"></div>
+    <div class="manual-tag-actions">
+        <button class="primary" id="manualTagDialogAdd" data-manual-control>Add tags</button>
+        <button id="manualTagDialogRemove" data-manual-control>Remove tags</button>
+        <button class="primary" id="manualTagDialogFilter">Apply filter</button>
+        <button id="manualTagDialogClear">Clear filter</button>
+        <button id="manualTagDialogCancel">Cancel</button>
+    </div>
+</dialog>
+
 <div class="selection-bar" id="selectionBar">
     <span class="sel-count" id="selCount">0 selected</span>
     <div class="coll-picker">
@@ -3275,6 +3444,7 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
     </div>
     <button class="sel-btn" id="selRemColl" style="display:none">&#x2716; Remove from collection</button>
     <button class="sel-btn" id="selAutoTag" style="display:none">AI Tag</button>
+    <button class="sel-btn" id="selManualTags">Tags</button>
     <button class="sel-btn" id="selCompare" onclick="openCompare()">&#x1F50D; Compare</button>
     <button class="sel-btn" id="selExportPrompts" title="Download positive prompts as a TXT file">Export prompts</button>
     <button class="sel-btn" id="selClear">Clear</button>
@@ -3457,6 +3627,8 @@ function saveGalleryStateNow() {
             specialView: specialView || '',
             aiTags: aiTagFilter.slice(),
             aiFolder: aiTagFolder || '',
+            manualTags: manualTagFilter.slice(),
+            manualFolder: manualTagFolder || '',
             selectedImage: selectedFile || '',
             scrollTop: area ? area.scrollTop : 0
         }));
@@ -3828,6 +4000,240 @@ async function doSearch(quiet) {
 // ═══════════════════════════════════════════════════════
 // ── Optional Auto Tagger filters
 // ═══════════════════════════════════════════════════════
+
+// Manual image labels are always available, independently of Auto Tagger.
+var manualTagFilter = [];
+var manualTagFolder = '';
+var manualTagBusy = false;
+var manualImageTagRequest = 0;
+var manualDialogRequest = 0;
+var manualTagDialogState = null;
+
+function parseManualTags(value) {
+    var tags = [];
+    String(value || '').split(',').forEach(function(tag) {
+        tag = tag.trim().toLowerCase().replace(/\s+/g, '_');
+        if (tag && tags.indexOf(tag) < 0) tags.push(tag);
+    });
+    return tags;
+}
+
+function updateManualFilterButton() {
+    var button = document.getElementById('manualTagsBtn');
+    if (!button) return;
+    var active = specialView === 'manual-tags' && manualTagFilter.length > 0;
+    button.classList.toggle('active', active);
+    document.getElementById('manualTagsLabel').textContent = active ? ('My tags (' + manualTagFilter.length + ')') : 'My tags';
+    button.title = active ? ('All tags: ' + manualTagFilter.join(', ')) : 'Filter by your own image tags';
+}
+
+async function loadManualTagView(resetPage, quiet) {
+    if (!manualTagFilter.length) return;
+    var request = ++galleryRequestId;
+    if (!quiet) activateSpecialView('manual-tags', null, resetPage !== false);
+    updateManualFilterButton();
+    var sort = document.getElementById('sortSelect').value.split('-');
+    var data = await fetchGalleryData('/api/gallery/manual-tags/files?tags=' + encodeURIComponent(manualTagFilter.join(',')) +
+        '&folder=' + encodeURIComponent(manualTagFolder) + '&sort=' + sort[0] + '&order=' + sort[1] +
+        '&page=' + currentPage + modelInfoParam() + metadataFilterParam(), request);
+    if (request !== galleryRequestId || !data) return;
+    if (data.revision !== undefined) lastGalleryRevision = data.revision;
+    currentFiles = data.files || [];
+    totalPages = data.pages || 1;
+    currentPage = data.page || 1;
+    if (currentPage > totalPages) {
+        currentPage = totalPages;
+        return loadManualTagView(false, true);
+    }
+    renderGalleryFiles(currentFiles, data.total || 0, true, quiet);
+    renderPagination();
+    updateToolbarNav();
+    updateBreadcrumb(manualTagFolder);
+    var breadcrumb = document.getElementById('breadcrumb');
+    if (breadcrumb) breadcrumb.insertAdjacentHTML('beforeend', '<span class="sep">&#x203A;</span><span>My tags: ' + escHtml(manualTagFilter.join(' + ')) + '</span>');
+    scheduleGalleryStateSave();
+}
+
+async function suggestManualTags(input, listId) {
+    var value = input.value;
+    var parts = value.split(',');
+    var query = parts.pop().trim();
+    var rows = await API.get('/api/gallery/manual-tags/suggest?q=' + encodeURIComponent(query));
+    if (!Array.isArray(rows) || !input.isConnected || input.value !== value) return;
+    var list = document.getElementById(listId);
+    if (!list) return;
+    list.replaceChildren();
+    rows.forEach(function(row) {
+        var option = document.createElement('option');
+        option.value = parts.concat([row.name]).join(', ');
+        option.label = row.name + ' (' + row.count + ')';
+        list.appendChild(option);
+    });
+}
+
+function bindManualTagSuggestions(input, listId) {
+    var timer;
+    input.addEventListener('input', function() {
+        clearTimeout(timer);
+        timer = setTimeout(function() { suggestManualTags(input, listId); }, 180);
+    });
+    input.addEventListener('focus', function() { suggestManualTags(input, listId); });
+}
+
+function renderManualRecents(element, rows, choose) {
+    element.replaceChildren();
+    (rows || []).slice(0, 8).forEach(function(row) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = row.name;
+        button.setAttribute('data-manual-control', '');
+        button.disabled = manualTagBusy;
+        button.title = row.count + ' images';
+        button.addEventListener('click', function() { choose(row.name); });
+        element.appendChild(button);
+    });
+    if (!element.childNodes.length) element.textContent = 'No tags used yet.';
+}
+
+function setManualTagBusy(busy) {
+    manualTagBusy = busy;
+    document.querySelectorAll('[data-manual-control]').forEach(function(control) { control.disabled = busy; });
+}
+
+async function changeManualTags(paths, tags, action) {
+    if (manualTagBusy) return null;
+    paths = paths.slice();
+    tags = tags.slice();
+    if (!paths.length || !tags.length) { showToast('Select images and enter at least one tag.'); return null; }
+    setManualTagBusy(true);
+    var result;
+    try {
+        result = await API.post('/api/gallery/manual-tags', {paths:paths, tags:tags, action:action});
+        if (result && result.ok) {
+            showToast('Tags updated on ' + result.matched + ' images' + (result.skipped ? (' · ' + result.skipped + ' not indexed') : ''));
+            if (specialView === 'manual-tags') await loadManualTagView(false, true);
+        }
+    } finally {
+        setManualTagBusy(false);
+        if (result && result.ok && selectedFile) loadImageManualTags(selectedFile);
+    }
+    return result;
+}
+
+async function loadImageManualTags(path) {
+    var request = ++manualImageTagRequest;
+    var section = document.getElementById('manualImageTags');
+    if (!section) return;
+    var data = await API.get('/api/gallery/manual-tags?path=' + encodeURIComponent(path));
+    if (request !== manualImageTagRequest || selectedFile !== path ||
+            document.getElementById('manualImageTags') !== section) return;
+    if (!data || !Array.isArray(data.tags)) {
+        section.innerHTML = '<div class="manual-tag-hint">My tags unavailable. Reselect the image to retry.</div>';
+        return;
+    }
+    section.innerHTML = '<h3>My tags</h3><div class="manual-tag-list"></div>' +
+        '<div class="manual-tag-entry"><input class="manual-tag-input" id="manualImageTagInput" aria-label="Add my tags" list="manualImageSuggestions" placeholder="great_pose, great_clothes" maxlength="1620" autocomplete="off" data-manual-control>' +
+        '<button type="button" id="manualImageTagAdd" data-manual-control>Add</button></div>' +
+        '<datalist id="manualImageSuggestions"></datalist><p class="manual-tag-hint">Recent · click to apply</p><div class="manual-recent"></div>';
+    var list = section.querySelector('.manual-tag-list');
+    data.tags.forEach(function(tag) {
+        var chip = document.createElement('span');
+        chip.className = 'manual-tag-chip';
+        var filter = document.createElement('button');
+        filter.type = 'button'; filter.textContent = tag; filter.title = 'Filter by ' + tag;
+        filter.addEventListener('click', function() { openManualTagDialog('filter', [tag]); });
+        var remove = document.createElement('button');
+        remove.type = 'button'; remove.textContent = '\u00D7';
+        remove.setAttribute('aria-label', 'Remove tag ' + tag);
+        remove.setAttribute('data-manual-control', '');
+        remove.addEventListener('click', function() { changeManualTags([path], [tag], 'remove'); });
+        chip.appendChild(filter); chip.appendChild(remove); list.appendChild(chip);
+    });
+    if (!data.tags.length) list.innerHTML = '<span class="manual-tag-hint">No own tags yet.</span>';
+    var input = section.querySelector('input');
+    bindManualTagSuggestions(input, 'manualImageSuggestions');
+    function add() { changeManualTags([path], parseManualTags(input.value), 'add'); }
+    input.addEventListener('keydown', function(event) { if (event.key === 'Enter') { event.preventDefault(); add(); } });
+    section.querySelector('#manualImageTagAdd').addEventListener('click', add);
+    renderManualRecents(section.querySelector('.manual-recent'), data.recent, function(tag) {
+        changeManualTags([path], [tag], 'add');
+    });
+    // A selection change during a request must not enable a second mutation.
+    setManualTagBusy(manualTagBusy);
+}
+
+async function openManualTagDialog(mode, tags) {
+    var dialog = document.getElementById('manualTagDialog');
+    var paths = mode === 'edit' ? Array.from(multiSelected) : [];
+    if (mode === 'edit' && !paths.length && selectedFile) paths = [selectedFile];
+    if (mode === 'edit' && !paths.length) { showToast('Select an image first.'); return; }
+    var request = ++manualDialogRequest;
+    var folder = specialView === 'manual-tags' ? manualTagFolder : (currentFolder || '');
+    manualTagDialogState = {mode:mode, paths:paths, folder:folder};
+    document.getElementById('manualTagDialogTitle').textContent = mode === 'edit' ? ('Tag ' + paths.length + ' images') : 'Filter my tags';
+    document.getElementById('manualTagDialogHint').textContent = mode === 'edit' ?
+        'Add or remove these tags. Other tags on each image are kept.' :
+        'All tags must match. Folder scope: ' + (folder ? folder + ' and subfolders.' : 'all image folders.');
+    document.getElementById('manualTagScope').hidden = mode === 'edit';
+    document.getElementById('manualTagAllFolders').checked = !folder;
+    document.getElementById('manualTagDialogAdd').hidden = mode !== 'edit';
+    document.getElementById('manualTagDialogRemove').hidden = mode !== 'edit';
+    document.getElementById('manualTagDialogFilter').hidden = mode === 'edit';
+    document.getElementById('manualTagDialogClear').hidden = mode === 'edit';
+    var input = document.getElementById('manualTagDialogInput');
+    input.value = (tags || (mode === 'filter' ? manualTagFilter : [])).join(', ');
+    document.getElementById('manualDialogSuggestions').replaceChildren();
+    document.getElementById('manualTagDialogRecent').textContent = 'Loading recent tags...';
+    if (!dialog.open) dialog.showModal();
+    input.focus();
+    setManualTagBusy(manualTagBusy);
+    var rows = await API.get('/api/gallery/manual-tags/suggest');
+    if (request !== manualDialogRequest || !dialog.open) return;
+    renderManualRecents(document.getElementById('manualTagDialogRecent'), rows, function(tag) {
+        var values = parseManualTags(input.value);
+        if (values.indexOf(tag) < 0) values.push(tag);
+        input.value = values.join(', '); input.focus();
+    });
+}
+
+function clearManualTagFilter() {
+    manualTagFilter = []; manualTagFolder = '';
+    document.getElementById('manualTagDialog').close();
+    clearSpecialView(); updateManualFilterButton(); updateBreadcrumb(currentFolder);
+    loadGallery(currentFolder);
+}
+
+function initManualTagUi() {
+    var dialog = document.getElementById('manualTagDialog');
+    var input = document.getElementById('manualTagDialogInput');
+    bindManualTagSuggestions(input, 'manualDialogSuggestions');
+    dialog.addEventListener('keydown', function(event) { event.stopPropagation(); });
+    dialog.addEventListener('close', function() { manualDialogRequest++; });
+    document.getElementById('manualTagsBtn').addEventListener('click', function() { openManualTagDialog('filter'); });
+    document.getElementById('selManualTags').addEventListener('click', function() { openManualTagDialog('edit'); });
+    document.getElementById('manualTagDialogCancel').addEventListener('click', function() { dialog.close(); });
+    async function edit(action) {
+        var state = manualTagDialogState;
+        var result = await changeManualTags(state.paths, parseManualTags(input.value), action);
+        if (result && result.ok && state === manualTagDialogState && dialog.open) dialog.close();
+    }
+    document.getElementById('manualTagDialogAdd').addEventListener('click', function() { edit('add'); });
+    document.getElementById('manualTagDialogRemove').addEventListener('click', function() { edit('remove'); });
+    document.getElementById('manualTagDialogFilter').addEventListener('click', function() {
+        var tags = parseManualTags(input.value);
+        if (!tags.length) { showToast('Enter at least one tag.'); return; }
+        manualTagFilter = tags;
+        manualTagFolder = document.getElementById('manualTagAllFolders').checked ? '' : manualTagDialogState.folder;
+        dialog.close(); loadManualTagView(true);
+    });
+    input.addEventListener('keydown', function(event) {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            document.getElementById(manualTagDialogState.mode === 'edit' ? 'manualTagDialogAdd' : 'manualTagDialogFilter').click();
+        }
+    });
+    document.getElementById('manualTagDialogClear').addEventListener('click', clearManualTagFilter);
+}
 
 function parseAiTags(value) {
     var out = [];
@@ -4388,6 +4794,8 @@ function goToPage(page) {
     document.getElementById('galleryArea').scrollTop = 0;
     if (searchMode) {
         doSearch();
+    } else if (specialView === 'manual-tags') {
+        loadManualTagView(false);
     } else if (specialView === 'ai-tags') {
         loadAiTagView(false);
     } else if (specialView === 'favorites') {
@@ -4472,6 +4880,7 @@ function renderMetaPanel(meta, path) {
             '</div>' +
         '</div>' +
         '<div class="meta-preview" id="metaPreview"><img src="' + escAttr(thumbnailUrl(path, info.mtime, meta.processing)) + '" alt=""></div>' +
+        '<section class="manual-tag-editor" id="manualImageTags" aria-label="My image tags"><div class="manual-tag-hint">Loading my tags...</div></section>' +
         '<div class="meta-tabs">' +
         '<button class="meta-tab ' + (currentMetaTab==='metadata'?'active':'') + '" data-tab="metadata">Metadata</button>' +
         '<button class="meta-tab ' + (currentMetaTab==='raw'?'active':'') + '" data-tab="raw">Raw Metadata</button>' +
@@ -4484,6 +4893,7 @@ function renderMetaPanel(meta, path) {
     else html += '<div class="meta-empty">Loading AI tags...</div>';
     html += '</div>';
     panel.innerHTML = html;
+    loadImageManualTags(path);
     prepareThumbnail(panel.querySelector('.meta-preview img'));
     document.getElementById('metaDeleteBtn').disabled = deleteStarting || deleteObservedActive;
     document.getElementById('metaPinBtn').addEventListener('click', function() {
@@ -4788,6 +5198,7 @@ document.getElementById('lightbox').addEventListener('click', function(e){ if(e.
 document.getElementById('sortSelect').addEventListener('change', function() {
     currentPage = 1;
     if (searchMode) { doSearch(); }
+    else if (specialView === 'manual-tags') { loadManualTagView(true); }
     else if (specialView === 'ai-tags') { loadAiTagView(true); }
     else if (specialView === 'favorites') { loadFavorites(document.querySelector('#navFavorites'), true); }
     else if (specialView && specialView.startsWith('collection:')) {
@@ -4804,6 +5215,7 @@ document.getElementById('groupSelect').addEventListener('change', function() {
     try { localStorage.setItem('galleryGroupMode', galleryGroupMode); } catch (e) {}
     currentPage = 1;
     if (searchMode) { doSearch(); }
+    else if (specialView === 'manual-tags') { loadManualTagView(true); }
     else if (specialView === 'ai-tags') { loadAiTagView(true); }
     else if (specialView === 'favorites') { loadFavorites(document.querySelector('#navFavorites'), true); }
     else if (specialView && specialView.startsWith('collection:')) {
@@ -4823,6 +5235,7 @@ document.getElementById('metadataFilterSelect').addEventListener('change', funct
     metaCache = {};
     clearMultiSelect();
     if (searchMode) { doSearch(); }
+    else if (specialView === 'manual-tags') { loadManualTagView(true); }
     else if (specialView === 'ai-tags') { loadAiTagView(true); }
     else if (specialView === 'favorites') { loadFavorites(document.querySelector('#navFavorites'), true); }
     else if (specialView && specialView.startsWith('collection:')) {
@@ -5196,6 +5609,7 @@ function renderDeleteProgress(job) {
 
 async function loadCurrentGalleryView(quiet) {
     if (searchMode) return doSearch(quiet);
+    if (specialView === 'manual-tags') return loadManualTagView(false, quiet);
     if (specialView === 'ai-tags') return loadAiTagView(false, quiet);
     if (specialView === 'favorites') return loadFavorites(document.querySelector('#navFavorites'), false, quiet);
     if (specialView === 'today' || specialView === '7days' || specialView === '30days') {
@@ -5412,6 +5826,7 @@ async function updateFavCount() {
 function clearSpecialView() {
     var wasAiTags = specialView === 'ai-tags';
     specialView = null;
+    updateManualFilterButton();
     document.querySelectorAll('.sidebar-special').forEach(function(el) { el.classList.remove('active'); });
     if (wasAiTags) {
         aiTagFilter = [];
@@ -5431,6 +5846,7 @@ function activateSpecialView(view, el, resetPage) {
         loadFolderTree();
     }
     specialView = view;
+    updateManualFilterButton();
     if (resetPage) currentPage = 1;
     metaCache = {};
     document.querySelectorAll('.sidebar-special').forEach(function(s) { s.classList.remove('active'); });
@@ -5752,6 +6168,7 @@ function highlightFolderRetry(path) {
 (async function() {
     applyMetaPanelState();
     initAutoTaggerUi();
+    initManualTagUi();
     var info = await API.get('/api/info');
     if (info) hasTrash = !!info.trash;
     var savedState = loadGalleryState();
@@ -5795,6 +6212,10 @@ function highlightFolderRetry(path) {
         var aiInput = document.getElementById('aiFilterInput');
         if (aiInput) aiInput.value = aiTagFilter.join(', ');
         await loadAiTagView(false);
+    } else if (savedState.specialView === 'manual-tags' && Array.isArray(savedState.manualTags) && savedState.manualTags.length) {
+        manualTagFilter = parseManualTags(savedState.manualTags.join(','));
+        manualTagFolder = savedState.manualFolder || '';
+        await loadManualTagView(false);
     } else if (savedState.searchMode && savedState.searchQuery) {
         searchMode = true;
         searchQuery = savedState.searchQuery || '';
@@ -5912,7 +6333,7 @@ class GalleryModule(Module):
     """Module wrapper around GalleryDB + the HTML gallery UI."""
 
     name = "Gallery"
-    version = "1.2.17"
+    version = "1.3.0"
     release_stage = "stable"
     icon = "\U0001F5BC"   # 🖼
     description = "Browse and manage your AI-generated image collection."
@@ -6280,6 +6701,9 @@ class GalleryModule(Module):
             "/api/search": self._api_search,
             "/api/search_folder": self._api_search_folder,
             "/api/tags": self._api_tags,
+            "/api/gallery/manual-tags": self._api_manual_tags,
+            "/api/gallery/manual-tags/suggest": self._api_manual_tag_suggest,
+            "/api/gallery/manual-tags/files": self._api_manual_tag_files,
             "/api/collections": self._api_collections,
             "/api/collection/files": self._api_collection_files,
             "/api/file/collections": self._api_file_collections,
@@ -6290,6 +6714,7 @@ class GalleryModule(Module):
     def routes_post(self):
         return {
             "/api/gallery/export-prompts": self._api_export_prompts,
+            "/api/gallery/manual-tags": self._api_manual_tag_update,
             "/api/reindex": self._api_reindex,
             "/api/rebuild_search": self._api_rebuild_search,
             "/api/optimize_db": self._api_optimize_db,
@@ -6392,6 +6817,41 @@ class GalleryModule(Module):
     def _api_metadata_filter(qs):
         value = qs.get("metadata", ["all"])[0]
         return value if value in ("all", "with", "without") else "all"
+
+    def _api_manual_tags(self, handler, qs):
+        if not self._require_db(handler): return
+        data = self.db.get_manual_tags(qs.get("path", [""])[0])
+        if data is not None:
+            data["recent"] = self.db.suggest_manual_tags(limit=12)
+        handler.respond_json(data if data is not None else {"error": "Image is not indexed."},
+                             status=200 if data is not None else 404)
+
+    def _api_manual_tag_suggest(self, handler, qs):
+        if not self._require_db(handler): return
+        handler.respond_json(self.db.suggest_manual_tags(qs.get("q", [""])[0], handler._int(qs, "limit", 24)))
+
+    def _api_manual_tag_files(self, handler, qs):
+        if not self._require_db(handler): return
+        try:
+            data = self.db.get_manual_tag_files(
+                qs.get("tags", [""])[0].split(","), folder=qs.get("folder", [""])[0],
+                page=handler._int(qs, "page"), per_page=handler._int(qs, "per_page", DEFAULT_PER_PAGE),
+                sort=qs.get("sort", ["date"])[0], order=qs.get("order", ["desc"])[0],
+                include_model_info=self._api_wants_model_info(qs), metadata_filter=self._api_metadata_filter(qs))
+            handler.respond_json(data)
+        except ValueError as exc:
+            handler.respond_json({"error": str(exc)}, status=400)
+
+    def _api_manual_tag_update(self, handler, content_len, content_type):
+        if not self._require_db(handler): return
+        data = handler.read_body_json(content_len)
+        if not isinstance(data, dict):
+            handler.respond_json({"error": "Expected an object with paths, tags and action."}, status=400)
+            return
+        try:
+            handler.respond_json(self.db.update_manual_tags(data.get("paths"), data.get("tags"), data.get("action", "add")))
+        except ValueError as exc:
+            handler.respond_json({"error": str(exc)}, status=400)
 
     def _api_files(self, handler, qs):
         if not self._require_db(handler): return

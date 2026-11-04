@@ -2,7 +2,7 @@
 
 Browse, search and manage local AI image collections.
 
-- Version: `1.2.17`
+- Version: `1.3.0`
 - Channel: `stable`
 - Publisher: `official`
 
@@ -13,7 +13,7 @@ Browse, search and manage local AI image collections.
 3. Restart CyberHub after installation.
 
 Requires CyberHub 1.3.0 or newer. The ZIP attached to the
-[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.2.17)
+[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.3.0)
 can also be imported manually through **Settings**.
 
 See [the upgrade and test guide](docs/performance/2026-09-28/TESTEN.md) for installation,
@@ -55,6 +55,42 @@ Search, metadata filters, favorites, collections and model grouping work in
 both layouts. Group headings span all columns. Arrow keys follow the visible
 neighbouring cards in Masonry; Shift extends the selection in display order.
 Switching layouts preserves the current page and selection.
+
+## My tags in 1.3.0 (4 November 2026)
+
+Add your own image labels, such as `great_pose`, `great_clothes` or
+`photostudio_good_prompt`, directly in Gallery. This works without Auto Tagger
+or Prompt Library and is separate from prompt-derived and AI-generated tags.
+
+- Select an image and use **My tags** above the metadata tabs. Enter one or more
+  comma-separated tags and press Enter or **Add**. Suggestions reuse existing
+  labels; recently used labels can be applied with one click.
+- Remove a label from the image using its **×** button. Other labels are kept.
+- Select several images and choose **Tags** in the selection bar to add or remove
+  labels across the selection. The dialog snapshots the selected images.
+- Open **My tags** in the sidebar to filter images. Every selected tag must match.
+  By default the current folder and its subfolders are searched; choose **All
+  folders** for the whole collection. Clicking an assigned tag opens this filter.
+- Tag results retain pagination, sorting, model grouping, Grid/Masonry layouts
+  and the generation-metadata filter. **Clear filter** returns to the folder view.
+  The active tag filter is restored when the page reloads.
+
+Labels are lowercase, with whitespace converted to underscores. An operation
+accepts up to 20 labels (80 characters each) and 10,000 indexed images. Missing
+images are skipped and reported. Batch operations add/remove the specified labels
+without replacing the rest of an image's labels.
+
+Manual labels live in the local Gallery database, not in image files or prompts.
+They survive metadata processing, reindexing, search-index rebuilds, AI retagging
+and restarts. Include the Gallery database in backups; exporting an image alone
+does not carry its manual labels. The dedicated **My tags** filter searches these
+labels; the existing prompt search and AI tag filter retain their own behavior.
+Recently used label names remain available for reuse even after their last image
+assignment is removed. Deleting an indexed image cleans up its assignments.
+
+Update Gallery to **1.3.0** through Module Manager or import the release ZIP
+through Settings, restart CyberHub, then reload Gallery. The additional tag tables
+are created automatically; a full reindex or separate Core update is not required.
 
 ## Thumbnail repair in 1.2.17 (21 October 2026)
 
