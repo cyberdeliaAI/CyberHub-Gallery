@@ -2,7 +2,7 @@
 
 Browse, search and manage local AI image collections.
 
-- Version: `1.3.0`
+- Version: `1.3.1`
 - Channel: `stable`
 - Publisher: `official`
 
@@ -13,7 +13,7 @@ Browse, search and manage local AI image collections.
 3. Restart CyberHub after installation.
 
 Requires CyberHub 1.3.0 or newer. The ZIP attached to the
-[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.3.0)
+[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.3.1)
 can also be imported manually through **Settings**.
 
 See [the upgrade and test guide](docs/performance/2026-09-28/TESTEN.md) for installation,
@@ -56,13 +56,20 @@ both layouts. Group headings span all columns. Arrow keys follow the visible
 neighbouring cards in Masonry; Shift extends the selection in display order.
 Switching layouts preserves the current page and selection.
 
+## Collections sidebar
+
+Added in **1.3.1** (5 November 2026): click **Collections**
+or its arrow to collapse/expand the sidebar list. The browser remembers this
+choice across reloads. **+ New** remains available while collapsed. Collapsing
+the list preserves the selected collection and does not change its images.
+
 ## My tags in 1.3.0 (4 November 2026)
 
 Add your own image labels, such as `great_pose`, `great_clothes` or
 `photostudio_good_prompt`, directly in Gallery. This works without Auto Tagger
 or Prompt Library and is separate from prompt-derived and AI-generated tags.
 
-- Select an image and use **My tags** above the metadata tabs. Enter one or more
+- Select an image, open the **Tags** tab and use **My tags**. Enter one or more
   comma-separated tags and press Enter or **Add**. Suggestions reuse existing
   labels; recently used labels can be applied with one click.
 - Remove a label from the image using its **×** button. Other labels are kept.
@@ -88,7 +95,14 @@ labels; the existing prompt search and AI tag filter retain their own behavior.
 Recently used label names remain available for reuse even after their last image
 assignment is removed. Deleting an indexed image cleans up its assignments.
 
-Update Gallery to **1.3.0** through Module Manager or import the release ZIP
+In **1.3.1** (5 November 2026), the per-image editor
+now lives in **Tags**, the renamed **AI Tags** tab. **My tags** appears first;
+the existing **AI Tags** section appears below when Auto Tagger is available.
+The tab remains available without Auto Tagger. Metadata and Raw Metadata no
+longer show the editor. Sidebar filters, batch tagging and stored labels are
+unchanged.
+
+Update Gallery to **1.3.1** through Module Manager or import the release ZIP
 through Settings, restart CyberHub, then reload Gallery. The additional tag tables
 are created automatically; a full reindex or separate Core update is not required.
 

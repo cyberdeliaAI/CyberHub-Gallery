@@ -3009,6 +3009,11 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 .meta-civitai-words span { background:var(--bg-hover); border:1px solid var(--border); padding:1px 6px; border-radius:8px; font-size:9px; color:var(--text); font-family:var(--mono); }
 
 /* Collections */
+.coll-toggle { display:flex; align-items:center; gap:5px; flex:1; padding:4px 0; border:0; background:none; color:inherit; font:inherit; text-transform:inherit; letter-spacing:inherit; text-align:left; cursor:pointer; }
+.coll-toggle:hover { color:var(--text-bright); }
+.coll-toggle:focus-visible, .coll-add-btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.coll-toggle-arrow { width:12px; height:12px; flex-shrink:0; }
+.coll-toggle[aria-expanded="false"] .coll-toggle-arrow { transform:rotate(-90deg); }
 .coll-list { padding:0 0 4px 0; }
 .coll-item { display:flex; align-items:center; padding:4px 14px; cursor:pointer; gap:6px; font-size:12px; color:var(--text); transition:all .12s; border-left:3px solid transparent; }
 .coll-item:hover { background:var(--bg-hover); }
@@ -3019,11 +3024,11 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 .coll-del { font-size:11px; color:var(--text-dim); cursor:pointer; opacity:0; transition:all .15s; padding:0 2px; flex-shrink:0; }
 .coll-item:hover .coll-del { opacity:1; }
 .coll-del:hover { color:var(--red); }
-.coll-add-btn { padding:4px 14px; cursor:pointer; font-size:11px; color:var(--accent); transition:all .12s; display:flex; align-items:center; gap:4px; }
+.coll-add-btn { padding:4px 14px; cursor:pointer; font-size:11px; color:var(--accent); transition:all .12s; display:flex; align-items:center; gap:4px; background:none; border:0; font-family:inherit; font-weight:inherit; text-transform:inherit; letter-spacing:inherit; }
 .coll-add-btn:hover { background:var(--bg-hover); }
 
 /* Collection picker dropdown in selection bar */
-.manual-tag-editor { padding:10px 12px; border-bottom:1px solid var(--border); }
+.manual-tag-editor { padding:0 0 12px; margin-bottom:12px; border-bottom:1px solid var(--border); }
 .manual-tag-editor h3 { margin:0 0 7px; color:var(--text-dim); font-size:11px; }
 .manual-tag-list { display:flex; flex-wrap:wrap; gap:5px; margin:7px 0; }
 .manual-tag-chip { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; max-width:100%; }
@@ -3342,7 +3347,10 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
             </div>
             <div class="sidebar-divider"></div>
         </div>
-        <div class="sidebar-header">Collections <span class="coll-add-btn" id="collAddBtn">+ new</span></div>
+        <div class="sidebar-header">
+            <button type="button" class="coll-toggle" id="collToggleBtn" aria-expanded="true" aria-controls="collList" title="Collapse collections"><svg class="coll-toggle-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg>Collections</button>
+            <button type="button" class="coll-add-btn" id="collAddBtn">+ new</button>
+        </div>
         <div class="coll-list" id="collList"></div>
         <div class="sidebar-divider"></div>
         <div class="sidebar-header" id="sidebarHeader">Folders</div>
@@ -4880,20 +4888,20 @@ function renderMetaPanel(meta, path) {
             '</div>' +
         '</div>' +
         '<div class="meta-preview" id="metaPreview"><img src="' + escAttr(thumbnailUrl(path, info.mtime, meta.processing)) + '" alt=""></div>' +
-        '<section class="manual-tag-editor" id="manualImageTags" aria-label="My image tags"><div class="manual-tag-hint">Loading my tags...</div></section>' +
         '<div class="meta-tabs">' +
         '<button class="meta-tab ' + (currentMetaTab==='metadata'?'active':'') + '" data-tab="metadata">Metadata</button>' +
         '<button class="meta-tab ' + (currentMetaTab==='raw'?'active':'') + '" data-tab="raw">Raw Metadata</button>' +
-        (autoTaggerAvailable ? '<button class="meta-tab ' + (currentMetaTab==='ai-tags'?'active':'') + '" data-tab="ai-tags">AI Tags</button>' : '') +
+        '<button class="meta-tab ' + (currentMetaTab==='ai-tags'?'active':'') + '" data-tab="ai-tags">Tags</button>' +
         '<span class="meta-fav-btn" id="metaFavBtn" title="Toggle favorite (F)">' + favStar + '</span>' +
         '</div>' +
         '<div class="meta-content" id="metaContent">';
     if (currentMetaTab === 'metadata') html += renderParsedMeta(parsed, info, rawMeta, meta.civitai);
     else if (currentMetaTab === 'raw') html += renderRawMeta(rawMeta, info);
-    else html += '<div class="meta-empty">Loading AI tags...</div>';
+    else html += '<section class="manual-tag-editor" id="manualImageTags" aria-label="My image tags"><div class="manual-tag-hint">Loading my tags...</div></section>' +
+        (autoTaggerAvailable ? '<div class="meta-section" id="metaAiTagsSection"><div class="meta-empty">Loading AI tags...</div></div>' : '');
     html += '</div>';
     panel.innerHTML = html;
-    loadImageManualTags(path);
+    if (currentMetaTab === 'ai-tags') loadImageManualTags(path);
     prepareThumbnail(panel.querySelector('.meta-preview img'));
     document.getElementById('metaDeleteBtn').disabled = deleteStarting || deleteObservedActive;
     document.getElementById('metaPinBtn').addEventListener('click', function() {
@@ -4974,12 +4982,11 @@ function renderMetaPanel(meta, path) {
 }
 
 async function loadAutoTagsForMeta(path) {
+    var previous = document.getElementById('metaAiTagsSection');
+    if (!previous) return;
     var data = await API.get('/api/auto_tagger/tags?path=' + encodeURIComponent(path));
     if (!data || selectedFile !== path || currentMetaTab !== 'ai-tags') return;
-    var content = document.getElementById('metaContent');
-    if (!content) return;
-    var previous = document.getElementById('metaAiTagsSection');
-    if (previous) previous.remove();
+    if (document.getElementById('metaAiTagsSection') !== previous) return;
     var tags = data.tags || [];
     var text = tags.filter(function(tag){ return tag.category !== 'rating'; }).map(function(tag){ return tag.name; }).join(', ');
     var html = '<div class="meta-section" id="metaAiTagsSection"><div class="meta-section-title">AI Tags';
@@ -5000,7 +5007,7 @@ async function loadAutoTagsForMeta(path) {
         html += '<div style="font-size:11px;color:var(--text-dim)">Not tagged yet</div><div class="ai-tag-actions"><button data-ai-retag="1">Tag image</button></div>';
     }
     html += '</div>';
-    content.innerHTML = html;
+    previous.outerHTML = html;
     var section = document.getElementById('metaAiTagsSection');
     var copy = section.querySelector('[data-ai-copy]');
     if (copy) copy.addEventListener('click', function(){ copyPlainText(copy.dataset.aiCopy, copy); });
@@ -5912,6 +5919,29 @@ async function loadTimeline(period, el, resetPage, quiet) {
 
 var collectionsCache = [];
 
+function initCollectionsUi() {
+    var button = document.getElementById('collToggleBtn');
+    var list = document.getElementById('collList');
+    var collapsed = false;
+    try { collapsed = localStorage.getItem('galleryCollectionsCollapsed') === 'true'; } catch (e) {}
+    function apply() {
+        list.hidden = collapsed;
+        button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        button.title = collapsed ? 'Expand collections' : 'Collapse collections';
+    }
+    apply();
+    button.addEventListener('click', function() {
+        collapsed = !collapsed;
+        apply();
+        try { localStorage.setItem('galleryCollectionsCollapsed', String(collapsed)); } catch (e) {}
+    });
+    [button, document.getElementById('collAddBtn')].forEach(function(control) {
+        control.addEventListener('keydown', function(event) {
+            if (event.key === 'Enter' || event.key === ' ') event.stopPropagation();
+        });
+    });
+}
+
 async function loadCollections() {
     var data = await API.get('/api/collections');
     if (!data) return;
@@ -6169,6 +6199,7 @@ function highlightFolderRetry(path) {
     applyMetaPanelState();
     initAutoTaggerUi();
     initManualTagUi();
+    initCollectionsUi();
     var info = await API.get('/api/info');
     if (info) hasTrash = !!info.trash;
     var savedState = loadGalleryState();
@@ -6333,7 +6364,7 @@ class GalleryModule(Module):
     """Module wrapper around GalleryDB + the HTML gallery UI."""
 
     name = "Gallery"
-    version = "1.3.0"
+    version = "1.3.1"
     release_stage = "stable"
     icon = "\U0001F5BC"   # 🖼
     description = "Browse and manage your AI-generated image collection."
