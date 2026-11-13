@@ -105,6 +105,45 @@ class RootAvailabilityTests(unittest.TestCase):
         db.index_tree(force=True)
         self.assertEqual(self.user_data(db), self.SEEDED)
 
+    def test_offline_root_keeps_auto_tagger_scores(self):
+        # Auto Tagger stores its scores next to Gallery's rows and removes them
+        # with a trigger when a files row is deleted (same DDL as Auto Tagger 1.0.7).
+        db = self.seed_user_data()
+        conn = db._get_conn()
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS auto_tagger_files (
+                file_path TEXT PRIMARY KEY, source_mtime REAL DEFAULT 0,
+                model_revision TEXT DEFAULT '', status INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS auto_tagger_scores (
+                file_path TEXT, tag_name TEXT, category TEXT, score REAL,
+                PRIMARY KEY (file_path, tag_name, category));
+            CREATE TRIGGER IF NOT EXISTS auto_tagger_cleanup_file
+            AFTER DELETE ON files BEGIN
+                DELETE FROM auto_tagger_scores WHERE file_path=OLD.path;
+                DELETE FROM auto_tagger_files WHERE file_path=OLD.path;
+            END;
+        """)
+        for path in ("Archive/x1.png", "Archive/sub/x2.png"):
+            conn.execute("INSERT INTO auto_tagger_files(file_path, status) VALUES (?, 1)", (path,))
+            conn.executemany("INSERT INTO auto_tagger_scores VALUES (?, ?, 'general', ?)",
+                             [(path, "forest", 0.91), (path, "lake", 0.72)])
+        conn.commit()
+
+        def scores(current):
+            return current._get_conn().execute("SELECT COUNT(*) FROM auto_tagger_scores").fetchone()[0]
+
+        self.assertEqual(scores(db), 4)
+        unplugged = self.base / "Archive_unplugged"
+        self.archive.rename(unplugged)
+        db = self.open_db()
+        db.index_tree(force=False)
+        self.assertEqual(scores(db), 4)
+        unplugged.rename(self.archive)
+        db = self.open_db()
+        db.index_tree(force=False)
+        self.assertEqual(scores(db), 4)
+        self.assertEqual(self.user_data(db), self.SEEDED)
+
     def test_removing_a_root_in_settings_still_prunes_it(self):
         self.seed_user_data()
         self.folders = [str(self.photos)]
