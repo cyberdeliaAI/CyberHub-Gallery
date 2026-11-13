@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sqlite3
+import stat as _stat
 import sys
 import threading
 import time
@@ -146,6 +147,61 @@ def safe_resolve(root, rel_path):
         return full
     except (ValueError, OSError):
         return None
+
+
+def gallery_roots_from_settings(folders):
+    """Return ({display name: absolute path}, {offline names}) for configured folders.
+
+    Every configured folder gets a name, including one that is offline right
+    now (an unplugged drive, or a NAS that is not mounted yet). Names are the
+    DB identity of their images, so they must not shift with availability, and
+    an offline folder keeps its records until it is removed in Settings.
+    """
+    roots = {}
+    offline = set()
+    for folder in folders or []:
+        folder = str(folder or "").strip()
+        if not folder:
+            continue
+        name = os.path.basename(folder.rstrip("/\\"))
+        # Disambiguate duplicate basenames
+        base_name = name
+        counter = 2
+        while name in roots:
+            name = f"{base_name}_{counter}"
+            counter += 1
+        roots[name] = os.path.abspath(folder)
+        if not os.path.isdir(folder):
+            offline.add(name)
+    return roots, offline
+
+
+def directory_state(path):
+    """Return "dir", "missing" or "unknown" for `path`.
+
+    Only "missing" may lead to removing records. Permission, network and device
+    errors return "unknown": a share that does not answer is not a deletion.
+    """
+    if not path:
+        return "unknown"
+    try:
+        mode = os.stat(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return "missing"
+    except (OSError, ValueError):
+        return "unknown"
+    return "dir" if _stat.S_ISDIR(mode) else "missing"
+
+
+def _within_folders(path, folders):
+    """True when DB path `path` is one of `folders` or lies below one of them."""
+    while path:
+        if path in folders:
+            return True
+        if "/" not in path:
+            return False
+        path = path.rsplit("/", 1)[0]
+    return False
 
 
 # ─── Parallel file reader ──────────────────────────────────────────────────────
@@ -522,6 +578,9 @@ class GalleryDB:
         all_folders = set() if prune_deleted else None
         all_files = set() if prune_deleted else None
         scanned_roots = set()
+        # DB folder paths that os.walk could not list. Their absence from the
+        # scan says nothing about the disk, so cleanup must leave them alone.
+        unreadable_folders = set()
         with self.lock:
             estimated_total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         with self._scan_status_lock:
@@ -551,13 +610,14 @@ class GalleryDB:
 
         for root_name, root_abs in self.roots.items():
             if not os.path.isdir(root_abs):
-                print(f"[INDEX] Root unavailable, skipping: {root_name} -> {root_abs}")
+                print(f"[INDEX] Root unavailable, skipping (records kept): {root_name} -> {root_abs}")
                 continue
             print(f"[INDEX] Scanning root: {root_name}")
             with self._scan_status_lock:
                 self._scan_status["root"] = root_name
             scanned_roots.add(root_name)
-            for dirpath, dirnames, filenames in os.walk(root_abs):
+            walk_errors = []
+            for dirpath, dirnames, filenames in os.walk(root_abs, onerror=walk_errors.append):
                 dirnames[:] = [d for d in dirnames if not d.startswith(".")]
                 rel_dir = os.path.relpath(dirpath, root_abs).replace("\\", "/")
                 if rel_dir == ".":
@@ -661,12 +721,32 @@ class GalleryDB:
                         print(f"[INDEX] {queued_files} new/updated files queued "
                               f"({scanned_files} scanned)...")
                         last_progress = now
+            for error in walk_errors:
+                unreadable_folders.add(self._unreadable_db_folder(root_name, root_abs, error))
+            if walk_errors:
+                print(
+                    f"[INDEX] {len(walk_errors)} folder(s) in {root_name} could not be read; "
+                    "their records are kept"
+                )
         flush_discovery()
         print(
             f"[INDEX] Scan complete: {scanned_files} image files seen, "
             f"{queued_files} new/updated queued, {skipped_dirs} unchanged folders skipped. "
             "Finalizing database..."
         )
+        # Prune only below roots that are still present after the scan and
+        # whose top folder could be listed. A drive that disconnected during
+        # the scan, or an unreadable folder, is not evidence of deletion.
+        prune_roots = {
+            name for name in scanned_roots
+            if name not in unreadable_folders and directory_state(self.roots.get(name)) == "dir"
+        }
+        for name in sorted(scanned_roots - prune_roots):
+            print(f"[INDEX] Root became unavailable or unreadable during the scan, records kept: {name}")
+
+        def readable(path):
+            return not (unreadable_folders and _within_folders(path, unreadable_folders))
+
         with self.lock:
             stale_roots = self._prune_unconfigured_roots(conn)
             pruned_files += stale_roots[0]
@@ -675,20 +755,26 @@ class GalleryDB:
                 print("[INDEX] Checking for deleted files...")
                 # Only prune files/folders belonging to roots that were actually scanned
                 ef = {r[0] for r in conn.execute("SELECT path FROM files").fetchall()}
-                td = {p for p in (ef - all_files) if p.split("/", 1)[0] in scanned_roots}
+                td = {
+                    p for p in (ef - all_files)
+                    if p.split("/", 1)[0] in prune_roots and readable(p.rsplit("/", 1)[0])
+                }
                 if td:
                     td_list = list(td)
                     for i in range(0, len(td_list), 1000):
                         pruned_files += self._prune_file_records(conn, td_list[i:i + 1000])
                         print(f"[INDEX] Pruned {min(i + 1000, len(td_list))}/{len(td_list)} deleted files...")
                 ef2 = {r[0] for r in conn.execute("SELECT path FROM folders").fetchall()}
-                td2 = {p for p in (ef2 - all_folders) if p.split("/", 1)[0] in scanned_roots}
+                td2 = {
+                    p for p in (ef2 - all_folders)
+                    if p.split("/", 1)[0] in prune_roots and readable(p)
+                }
                 if td2:
                     conn.executemany("DELETE FROM folders WHERE path=?", [(p,) for p in td2])
                     pruned_folders += len(td2)
                     print(f"[INDEX] Pruned {len(td2)} deleted folders")
             else:
-                missing = self._prune_missing_folders(conn, scanned_roots)
+                missing = self._prune_missing_folders(conn, prune_roots, keep=unreadable_folders)
                 pruned_files += missing[0]
                 pruned_folders += missing[1]
                 print("[INDEX] Full deleted-file prune skipped for quick startup scan")
@@ -724,6 +810,24 @@ class GalleryDB:
         with self._scan_status_lock:
             self._scan_status["active"] = False
             self._scan_status["error"] = str(error)[:300]
+
+    @staticmethod
+    def _unreadable_db_folder(root_name, root_abs, error):
+        """Map an os.walk error to the DB folder path it covers.
+
+        Anything that cannot be placed below the root conservatively covers the
+        whole root, so nothing in it is pruned.
+        """
+        failed = getattr(error, "filename", None)
+        if not failed:
+            return root_name
+        try:
+            relative = os.path.relpath(os.path.abspath(failed), root_abs).replace("\\", "/")
+        except (TypeError, ValueError):
+            return root_name
+        if relative == "." or relative == ".." or relative.startswith("../"):
+            return root_name
+        return root_name + "/" + relative
 
     def _map_absolute_path(self, absolute_path):
         candidate = os.path.abspath(absolute_path)
@@ -789,6 +893,11 @@ class GalleryDB:
                 try:
                     stat = os.stat(absolute)
                 except FileNotFoundError:
+                    # Everything below an unmounted drive or NAS is "not
+                    # found" too. Only a root that is still present can
+                    # report a real deletion.
+                    if directory_state(root_abs) != "dir":
+                        continue
                     stat = None
                 except OSError:
                     # A disconnected share/permission error is not a deletion.
@@ -1750,17 +1859,24 @@ class GalleryDB:
         conn.executemany("UPDATE tags SET count=(SELECT COUNT(*) FROM file_tags WHERE tag_id=tags.id) WHERE id=?", ids)
         conn.executemany("DELETE FROM tags WHERE id=? AND count=0", ids)
 
-    def _prune_missing_folders(self, conn, scanned_roots):
+    def _prune_missing_folders(self, conn, scanned_roots, keep=()):
         """Remove folders that are in SQLite but no longer exist on disk.
 
         Quick startup scans intentionally avoid comparing every file in the DB.
         Folder existence checks are much cheaper, and they keep the sidebar from
         showing deleted directories with broken thumbnails.
+
+        Only a folder that is reported as not found below a root that is still
+        present counts as deleted. Roots that went offline, folders in `keep`
+        (unreadable during the scan) and I/O errors keep their records.
         """
         if not scanned_roots:
             return 0, 0
         rows = []
         for root in scanned_roots:
+            if directory_state(self.roots.get(root)) != "dir":
+                print(f"[INDEX] Root unavailable during cleanup, records kept: {root}")
+                continue
             rows.extend(conn.execute(
                 "SELECT path FROM folders WHERE path=? OR path LIKE ? ORDER BY LENGTH(path)",
                 (root, root + "/%")
@@ -1772,8 +1888,12 @@ class GalleryDB:
         for (folder_path,) in rows:
             if any(folder_path == m or folder_path.startswith(m + "/") for m in missing_roots):
                 continue
+            if keep and _within_folders(folder_path, keep):
+                continue
             abs_path = self.resolve_path(folder_path)
-            if abs_path and os.path.isdir(abs_path):
+            # None means the folder now resolves outside its root (for example
+            # a replaced symlink); that keeps the established prune behavior.
+            if abs_path is not None and directory_state(abs_path) != "missing":
                 continue
             missing_roots.append(folder_path)
 
@@ -1799,7 +1919,8 @@ class GalleryDB:
 
         Settings stores the selected root folders, while SQLite stores the indexed
         tree. If a root is removed from Settings, scans no longer visit it, so its
-        old rows need an explicit cleanup pass.
+        old rows need an explicit cleanup pass. Configured roots that are offline
+        are still in `self.roots` and are never treated as unconfigured.
         """
         configured = set(self.roots.keys())
         if not configured:
@@ -6570,6 +6691,9 @@ class GalleryModule(Module):
         handler = GalleryWatchHandler()
         scheduled = 0
         for root in self.db.roots.values():
+            if not os.path.isdir(root):
+                print(f"[GALLERY] Not watching offline folder {root}; rescan after reconnecting")
+                continue
             try:
                 observer.schedule(handler, root, recursive=True)
                 scheduled += 1
@@ -6653,19 +6777,11 @@ class GalleryModule(Module):
         DEFAULT_PER_PAGE = int(self.setting("per_page", 200) or 200)
         _metadata_mod.VERBOSE = bool(self.setting("verbose", False)) or _metadata_mod.VERBOSE
 
-        # Build roots dict from valid folders
-        roots = {}
-        for f in (folders or []):
-            f = f.strip()
-            if f and os.path.isdir(f):
-                name = os.path.basename(f.rstrip("/\\"))
-                # Disambiguate duplicate basenames
-                base_name = name
-                counter = 2
-                while name in roots:
-                    name = f"{base_name}_{counter}"
-                    counter += 1
-                roots[name] = os.path.abspath(f)
+        # Every configured folder stays a root, also while it is offline. Only
+        # removing a folder in Settings makes its records "unconfigured"; an
+        # unavailable folder is skipped by scans and keeps favorites, tags,
+        # collections and AI tags until it is reachable again.
+        roots, offline_roots = gallery_roots_from_settings(folders)
 
         if not roots:
             print("[GALLERY] No image folder configured. Open Settings to add one.")
@@ -6678,7 +6794,10 @@ class GalleryModule(Module):
         os.makedirs(self.thumb_dir, exist_ok=True)
 
         for rn, rp in roots.items():
-            print(f"[GALLERY] Root: {rn} -> {rp}")
+            if rn in offline_roots:
+                print(f"[GALLERY] Root: {rn} -> {rp} (offline; records kept, rescan after reconnecting)")
+            else:
+                print(f"[GALLERY] Root: {rn} -> {rp}")
         migrate_thumb_layout(self.thumb_dir)
         self.db = GalleryDB(db_path, self.thumb_dir, roots)
         self._start_filesystem_watcher()

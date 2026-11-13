@@ -106,6 +106,20 @@ Update Gallery to **1.3.1** through Module Manager or import the release ZIP
 through Settings, restart CyberHub, then reload Gallery. The additional tag tables
 are created automatically; a full reindex or separate Core update is not required.
 
+## Offline and unreadable folders
+
+An image folder that is unavailable when CyberHub starts, such as an unplugged
+drive or a NAS that is not mounted yet, stays configured. Gallery skips it while
+it is offline and keeps its images, favorites, collections, tags, My tags and AI
+tags in the database. Cached thumbnails remain visible. After reconnecting the
+folder, run **Settings → Maintenance → Re-index folders** or restart CyberHub to pick up
+changes and resume folder watching.
+
+A folder that cannot be read during a scan, or a drive that disconnects while
+CyberHub runs, is never treated as deleted. Records are only removed for files
+and folders that are reported as not found below a folder that is still present,
+or for a folder you remove from **Settings → Gallery**.
+
 ## Thumbnail repair in 1.2.17 (21 October 2026)
 
 The fix for [issue #4](https://github.com/cyberdeliaAI/CyberHub/issues/4) makes **Generate All Thumbs** check that current
