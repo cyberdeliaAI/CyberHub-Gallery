@@ -3263,6 +3263,14 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 .confirm-dialog .btn-delete { background:var(--red); color:#fff; border-color:var(--red); }
 .confirm-dialog .btn-delete:hover { background:#dc2626; }
 .confirm-dialog button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.confirm-dialog .btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+.confirm-dialog .btn-primary:hover { background:var(--accent-dim); }
+.confirm-dialog .text-prompt-label { display:block; font-size:12px; color:var(--text-dim); margin-bottom:6px; }
+.confirm-dialog .text-prompt-input {
+    width:100%; box-sizing:border-box; margin-bottom:16px; padding:7px 10px; font:inherit; font-size:13px;
+    color:var(--text); background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius);
+}
+.confirm-dialog .text-prompt-input:focus { outline:2px solid var(--accent); outline-offset:1px; }
 </style>
 </head>
 <body class="{BODY_CLASS}">
@@ -3461,7 +3469,7 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
 
 <div class="delete-progress" id="deleteProgress" role="status" aria-live="polite">
     <div class="delete-progress-head">
-        <span id="deleteProgressTitle">Moving images to system trash</span>
+        <span id="deleteProgressTitle">Moving images to the trash</span>
         <span class="delete-progress-count" id="deleteProgressCount"></span>
     </div>
     <div class="delete-progress-track"><div class="delete-progress-fill" id="deleteProgressFill"></div></div>
@@ -3475,6 +3483,18 @@ body { background:var(--bg-darkest); color:var(--text); font-family:var(--font);
         <div class="btn-row">
             <button class="btn-cancel" id="confirmCancel">Cancel</button>
             <button class="btn-delete" id="confirmOk">Delete</button>
+        </div>
+    </div>
+</div>
+
+<div class="confirm-overlay" id="textPromptOverlay">
+    <div class="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="textPromptTitle">
+        <h3 id="textPromptTitle"></h3>
+        <label class="text-prompt-label" for="textPromptInput" id="textPromptLabel"></label>
+        <input type="text" class="text-prompt-input" id="textPromptInput" maxlength="200" autocomplete="off" spellcheck="false">
+        <div class="btn-row">
+            <button class="btn-cancel" id="textPromptCancel">Cancel</button>
+            <button class="btn-primary" id="textPromptOk">OK</button>
         </div>
     </div>
 </div>
@@ -3532,12 +3552,15 @@ var currentMetaTab = 'metadata';
 var accordionFolders = {ACCORDION_FOLDERS};
 var skipDeleteConfirmation = {SKIP_DELETE_CONFIRMATION};
 var folderSortMode = '{FOLDER_SORT}';
-var galleryGroupMode = localStorage.getItem('galleryGroupMode') || 'none';
+function readStored(key, fallback) {
+    try { var value = localStorage.getItem(key); return value === null ? fallback : value; } catch (e) { return fallback; }
+}
+var galleryGroupMode = readStored('galleryGroupMode', 'none') || 'none';
 var galleryLayout = 'grid';
 try { if (localStorage.getItem('galleryLayout') === 'masonry') galleryLayout = 'masonry'; } catch (e) {}
 var galleryLayoutFrame = null;
 var galleryThumbObserver = null;
-var metadataFilter = localStorage.getItem('galleryMetadataFilter') || 'all';
+var metadataFilter = readStored('galleryMetadataFilter', 'all') || 'all';
 if (['all', 'with', 'without'].indexOf(metadataFilter) < 0) metadataFilter = 'all';
 var autoTaggerAvailable = {AUTO_TAGGER_AVAILABLE};
 var aiTagFilter = [];
@@ -3605,7 +3628,7 @@ async function fetchGalleryData(url, requestId) {
 
 var lastGalleryTotal = 0;
 var specialView = null; // null, 'favorites', timeline, collection, or 'ai-tags'
-var metaPanelPinned = localStorage.getItem('galleryMetaPinned') === '1';
+var metaPanelPinned = readStored('galleryMetaPinned', '0') === '1';
 var metaPanelCollapsed = !metaPanelPinned;
 var GALLERY_STATE_KEY = 'cyberdelia.gallery.state';
 var pendingRestoreScroll = null;
@@ -3689,7 +3712,7 @@ function setMetaPanelCollapsed(collapsed) {
 
 function setMetaPanelPinned(pinned) {
     metaPanelPinned = pinned;
-    localStorage.setItem('galleryMetaPinned', pinned ? '1' : '0');
+    try { localStorage.setItem('galleryMetaPinned', pinned ? '1' : '0'); } catch (e) {}
     applyMetaPanelState();
 }
 
@@ -5300,6 +5323,10 @@ document.addEventListener('keydown', function(e) {
         if (e.key === 'Escape') { document.getElementById('searchInput').blur(); }
         return;
     }
+    if (document.getElementById('textPromptOverlay').classList.contains('open')) {
+        if (e.key === 'Escape') { e.preventDefault(); finishTextPrompt(null); }
+        return;
+    }
     // Confirm dialog open? handle Escape/Enter and left/right button choice.
     if (document.getElementById('confirmOverlay').classList.contains('open')) {
         var cancelBtn = document.getElementById('confirmCancel');
@@ -5554,8 +5581,8 @@ function confirmDelete(paths) {
     document.getElementById('confirmOk').style.display = '';
     document.getElementById('confirmTitle').textContent = 'Delete ' + n + ' image' + (n > 1 ? 's' : '') + '?';
     document.getElementById('confirmMsg').textContent = n === 1
-        ? paths[0].split('/').pop() + ' will be moved to your system trash.'
-        : n + ' files will be moved to your system trash.';
+        ? paths[0].split('/').pop() + ' will be moved to the trash on the computer that runs CyberHub.'
+        : n + ' files will be moved to the trash on the computer that runs CyberHub.';
     overlay.classList.add('open');
     confirmCallback = function() { executeDelete(paths); };
     setTimeout(function(){ document.getElementById('confirmCancel').focus(); }, 0);
@@ -5573,6 +5600,39 @@ document.getElementById('confirmOk').addEventListener('click', function() {
 });
 document.getElementById('confirmOverlay').addEventListener('click', function(e) {
     if (e.target === e.currentTarget) closeConfirm();
+});
+
+// In-page text dialog. window.prompt() is not available everywhere (CyberHub
+// Desktop's window throws "prompt() is not supported"), so Gallery asks here.
+// Resolves with the entered text, or null when cancelled.
+var textPromptResolve = null;
+function askText(title, label, value, okLabel) {
+    if (textPromptResolve) finishTextPrompt(null);
+    var input = document.getElementById('textPromptInput');
+    document.getElementById('textPromptTitle').textContent = title;
+    document.getElementById('textPromptLabel').textContent = label || '';
+    document.getElementById('textPromptOk').textContent = okLabel || 'OK';
+    input.value = value || '';
+    document.getElementById('textPromptOverlay').classList.add('open');
+    setTimeout(function() { input.focus(); input.select(); }, 0);
+    return new Promise(function(resolve) { textPromptResolve = resolve; });
+}
+function finishTextPrompt(value) {
+    var resolve = textPromptResolve;
+    textPromptResolve = null;
+    document.getElementById('textPromptOverlay').classList.remove('open');
+    if (resolve) resolve(value);
+}
+document.getElementById('textPromptOk').addEventListener('click', function() {
+    finishTextPrompt(document.getElementById('textPromptInput').value);
+});
+document.getElementById('textPromptCancel').addEventListener('click', function() { finishTextPrompt(null); });
+document.getElementById('textPromptOverlay').addEventListener('click', function(e) {
+    if (e.target === e.currentTarget) finishTextPrompt(null);
+});
+document.getElementById('textPromptInput').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); finishTextPrompt(this.value); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finishTextPrompt(null); }
 });
 
 var deletePollTimer = null;
@@ -5608,7 +5668,7 @@ function renderDeleteProgress(job) {
     var total = Number(job.total || 0);
     var percent = total ? Math.max(0, Math.min(100, current / total * 100)) : 0;
     box.classList.add('visible');
-    document.getElementById('deleteProgressTitle').textContent = job.active ? 'Moving images to system trash' : (job.error ? 'Delete encountered an error' : 'Delete complete');
+    document.getElementById('deleteProgressTitle').textContent = job.active ? 'Moving images to the trash' : (job.error ? 'Delete encountered an error' : 'Delete complete');
     document.getElementById('deleteProgressCount').textContent = total ? current + ' / ' + total : '';
     document.getElementById('deleteProgressFill').style.width = percent + '%';
     document.getElementById('deleteProgressMessage').textContent = job.error || job.message || 'Preparing deletion';
@@ -6006,8 +6066,8 @@ async function viewCollection(col, resetPage, quiet) {
 }
 
 // Create new collection
-document.getElementById('collAddBtn').addEventListener('click', function() {
-    var name = prompt('New collection name:');
+document.getElementById('collAddBtn').addEventListener('click', async function() {
+    var name = await askText('New collection', 'Name', '', 'Create');
     if (!name || !name.trim()) return;
     API.post('/api/collection/create', { name: name.trim() }).then(function(r) {
         if (!r) return;
@@ -6312,7 +6372,7 @@ async function saveToLibrary() {
     var _seed    = st.Seed         || parsed.seed;      if (_seed)    smeta.seed = _seed;
     var _size    = st.Size || (info.width && info.height ? info.width + 'x' + info.height : '');
     if (_size) smeta.size = _size;
-    var title = prompt('Save to Prompt Library\n\nTitle:', (parsed.prompt || '').substring(0, 60).replace(/,.*/, '').trim() || 'Untitled');
+    var title = await askText('Save to Prompt Library', 'Title', (parsed.prompt || '').substring(0, 60).replace(/,.*/, '').trim() || 'Untitled', 'Save');
     if (title === null) return;
     var targetSel = document.getElementById('saveTargetSelect');
     var target = (targetSel && targetSel.value) || 'general';
@@ -7198,19 +7258,26 @@ class GalleryModule(Module):
         scope = str(data.get("scope", "paths"))
         if scope == "without_metadata":
             paths = self.db.get_without_metadata_paths()
+            # This scope has no upper limit, so the caller must confirm the exact
+            # count it showed the user. Settings has always sent it.
             expected = data.get("expected_count")
-            if expected is not None:
-                try:
-                    expected = int(expected)
-                except (TypeError, ValueError):
-                    handler.respond_json({"error": "Invalid expected count"}, status=400)
-                    return
-                if expected != len(paths):
-                    handler.respond_json({
-                        "error": "The number of images changed. Check the count and confirm again.",
-                        "count": len(paths),
-                    }, status=409)
-                    return
+            if expected is None or isinstance(expected, bool):
+                handler.respond_json({
+                    "error": "Confirm the number of images to delete (expected_count is required).",
+                    "count": len(paths),
+                }, status=400)
+                return
+            try:
+                expected = int(expected)
+            except (TypeError, ValueError):
+                handler.respond_json({"error": "Invalid expected count"}, status=400)
+                return
+            if expected != len(paths):
+                handler.respond_json({
+                    "error": "The number of images changed. Check the count and confirm again.",
+                    "count": len(paths),
+                }, status=409)
+                return
             label = "Deleting images without metadata"
         elif scope == "paths":
             paths = data.get("paths", [])
