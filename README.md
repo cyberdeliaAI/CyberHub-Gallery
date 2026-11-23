@@ -2,7 +2,7 @@
 
 Browse, search and manage local AI image collections.
 
-- Version: `1.3.1`
+- Version: `1.3.2`
 - Channel: `stable`
 - Publisher: `official`
 
@@ -13,16 +13,22 @@ Browse, search and manage local AI image collections.
 3. Restart CyberHub after installation.
 
 Requires CyberHub 1.3.0 or newer. The ZIP attached to the
-[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.3.1)
+[GitHub release](https://github.com/cyberdeliaAI/CyberHub-Gallery/releases/tag/v1.3.2)
 can also be imported manually through **Settings**.
 
 See [the upgrade and test guide](docs/performance/2026-09-28/TESTEN.md) for installation,
 checks with an existing large library and rollback to 1.2.14.
 
+## Add images to a collection
+
+Click one thumbnail, then choose **Add to…** in the selection bar and pick a
+collection. You can also enter a new collection name and press Enter. Use
+Ctrl/Cmd-click to toggle individual images or Shift-click to select a range.
+**Compare** appears when two to four images are selected.
+
 ## Export positive prompts
 
-Select images with Ctrl/Cmd-click or Shift-click, then click **Export prompts**
-in the selection bar between **Compare** and **Clear**. The browser downloads
+Select one or more images, then click **Export prompts** in the selection bar. The browser downloads
 `positive-prompts.txt` as UTF-8 text containing only the positive prompts, separated
 by a blank line. There are no filenames, headings, negative prompts or generation
 settings. Multiline prompts and special characters are preserved. Identical

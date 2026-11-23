@@ -193,3 +193,51 @@ test('skipped images are reported outside the clean TXT content',async()=>{
     assert.match(x.toasts[0],/1 still processing/);
     assert.equal(x.button.disabled,true);
 });
+
+test('single selection targets one collection item and still anchors toggles and ranges', async () => {
+    function classList() {
+        const values = new Set();
+        return {add: key => values.add(key), remove: key => values.delete(key), contains: key => values.has(key)};
+    }
+    const cards = ['a', 'b', 'c', 'd', 'e'].map(path => ({dataset: {path}, classList: classList()}));
+    const elements = {selectionBar: {classList: classList()}, selCompare: {style: {}}, selRemColl: {style: {}}, selCount: {}};
+    const requests = [];
+    const c = install({
+        multiSelected: new Set(), selectedFile: null, selectionAnchorFile: null, specialView: null,
+        document: {
+            getElementById: id => elements[id],
+            querySelectorAll: selector => selector === '.thumb-card' ? cards : cards.filter(card => card.classList.contains('multi-selected')),
+        },
+        selectImage(path, card, keepAnchor) {
+            c.selectedFile = path;
+            if (!keepAnchor) c.selectionAnchorFile = path;
+        },
+        API: {post: async (url, body) => { requests.push({url, body}); return {ok: true}; }},
+        showToast() {}, loadCollections() {},
+    }, 'selectSingleImage', 'toggleMultiSelect', 'findThumbCard', 'ensureSelectedFileInMultiSelect',
+    'rangeSelect', 'getCardIndexByPath', 'setRangeSelection', 'updateSelectionBar', 'clearMultiSelect', 'addSelectionToCollection');
+
+    c.selectSingleImage('a', cards[0]);
+    assert.ok(elements.selectionBar.classList.contains('visible'));
+    assert.equal(elements.selCount.textContent, '1 selected');
+    assert.equal(elements.selCompare.style.display, 'none');
+    await c.addSelectionToCollection(7, 'Keep');
+    assert.equal(requests[0].url, '/api/collection/add');
+    assert.deepEqual(Array.from(requests[0].body.paths), ['a']);
+    c.toggleMultiSelect('c', cards[2], true);
+    assert.deepEqual([...c.multiSelected], ['a', 'c']);
+    assert.equal(elements.selCompare.style.display, '');
+    c.rangeSelect(3);
+    assert.deepEqual([...c.multiSelected], ['a', 'b', 'c', 'd']);
+    assert.equal(elements.selCompare.style.display, '');
+    c.rangeSelect(4);
+    assert.equal(elements.selCompare.style.display, 'none');
+    c.selectSingleImage('b', cards[1]);
+    assert.deepEqual([...c.multiSelected], ['b']);
+    assert.deepEqual(cards.filter(card => card.classList.contains('multi-selected')), [cards[1]]);
+    c.toggleMultiSelect('b', cards[1], true);
+    assert.equal(elements.selectionBar.classList.contains('visible'), false);
+    c.selectSingleImage('d', cards[3]);
+    c.clearMultiSelect();
+    assert.equal(elements.selectionBar.classList.contains('visible'), false);
+});

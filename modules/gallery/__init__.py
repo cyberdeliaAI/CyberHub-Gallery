@@ -4587,9 +4587,7 @@ function createThumbCard(file, index) {
             e.preventDefault();
             rangeSelect(Array.from(document.querySelectorAll('.thumb-card')).indexOf(c));
         } else {
-            // Normal click: clear multi-select if any, then select for metadata
-            if (multiSelected.size > 0) { clearMultiSelect(); }
-            selectImage(fp, c);
+            selectSingleImage(fp, c);
         }
     }})(file.path, card, index));
     card.addEventListener('dblclick', (function(idx,fp){return function(){lightboxIndex=currentFiles.findIndex(function(f){return f.path===fp}); openLightbox('/image/'+encodeURIComponent(fp))}})(index, file.path));
@@ -5187,7 +5185,9 @@ function lightboxNav(delta) {
     var f = currentFiles[lightboxIndex];
     document.getElementById('lightboxImg').src = '/image/' + encodeURIComponent(f.path);
     updateLightboxCounter();
-    selectImage(f.path, document.querySelector('.thumb-card[data-index="'+lightboxIndex+'"]'));
+    var card = findThumbCard(f.path);
+    if (multiSelected.size === 1 && multiSelected.has(selectedFile)) selectSingleImage(f.path, card);
+    else selectImage(f.path, card);
 }
 function updateLightboxCounter() { document.getElementById('lbCounter').textContent = currentFiles.length > 0 ? (lightboxIndex+1)+' / '+currentFiles.length : ''; }
 document.getElementById('lbClose').addEventListener('click', function(e){e.stopPropagation();closeLightbox()});
@@ -5450,6 +5450,17 @@ function extendSelectionWithKeyboard(cards, fromIdx, toIdx) {
 }
 
 // ── Multi-select & Delete ──
+
+function selectSingleImage(path, card) {
+    multiSelected.clear();
+    document.querySelectorAll('.thumb-card.multi-selected').forEach(function(c) {
+        c.classList.remove('multi-selected');
+    });
+    multiSelected.add(path);
+    if (card) card.classList.add('multi-selected');
+    selectImage(path, card);
+    updateSelectionBar();
+}
 
 function ensureSelectedFileInMultiSelect(cards) {
     if (multiSelected.size > 0 || !selectedFile) return;
@@ -6045,11 +6056,12 @@ document.getElementById('collPickerInput').addEventListener('keydown', function(
     if (e.key === 'Enter') {
         var name = this.value.trim();
         if (!name) return;
+        var paths = Array.from(multiSelected);
         API.post('/api/collection/create', { name: name }).then(function(r) {
             if (!r || r.error) { showToast(r ? r.error : 'Error'); return; }
             showToast('Created "' + r.name + '"');
             loadCollections().then(function() {
-                addSelectionToCollection(r.id, r.name);
+                addSelectionToCollection(r.id, r.name, paths);
             });
             document.getElementById('collPickerMenu').classList.remove('open');
         });
@@ -6066,9 +6078,7 @@ document.addEventListener('click', function(e) {
     }
 });
 
-async function addSelectionToCollection(collId, collName) {
-    var paths = Array.from(multiSelected);
-    if (paths.length === 0 && selectedFile) paths = [selectedFile];
+async function addSelectionToCollection(collId, collName, paths = Array.from(multiSelected)) {
     if (paths.length === 0) return;
     var r = await API.post('/api/collection/add', { id: collId, paths: paths });
     if (!r) return;
@@ -6364,7 +6374,7 @@ class GalleryModule(Module):
     """Module wrapper around GalleryDB + the HTML gallery UI."""
 
     name = "Gallery"
-    version = "1.3.1"
+    version = "1.3.2"
     release_stage = "stable"
     icon = "\U0001F5BC"   # 🖼
     description = "Browse and manage your AI-generated image collection."
